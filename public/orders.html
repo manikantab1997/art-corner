@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Order History</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+
+    <!-- Navbar -->
+    <div class="navbar">
+        <button onclick="goBack()">⬅ Back</button>
+        <div class="nav-right">
+            <a href="admin.html">Admin</a>
+            <a href="index.html">🏠 Store</a>
+        </div>
+    </div>
+
+    <h1>Order History</h1>
+    <input id="search" placeholder="Search by name or order ID">
+    <select id="filter">
+        <option value="all">All</option>
+        <option value="Placed">Placed</option>
+        <option value="Delivered">Delivered</option>
+    </select>
+    <table border="1" id="ordersTable">
+        <thead>
+            <tr>
+                <th>Order ID</th>
+                <th>Name</th>
+                <th>Phone</th>
+                <th>Items</th>
+                <th>Status</th>
+                <th>Update</th>
+            </tr>
+        </thead>
+
+        <tbody></tbody>
+    </table>
+
+    <script src="orders.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Admin Panel</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+
+    <!-- Navbar -->
+    <div class="navbar">
+        <button onclick="goBack()">⬅ Back</button>
+        <div class="nav-right">
+            <a href="index.html">🏠 Categories</a>
+            <a href="cart.html">🛒 Cart</a>
+        </div>
+    </div>
+    <h1>Admin Panel</h1>
+    <a href="dashboard.html">
+        <button>Dashboard</button>
+    </a>
+    
+    <a href="orders.html">
+        <button>View Order History</button>
+    </a>
+    <h2>Add Product</h2>
+
+    <input id="name" placeholder="Name"><br>
+    <input id="price" placeholder="Price"><br>
+    <input id="category" placeholder="Category ID (1,2,3)"><br>
+    <input type="file" id="image"><br>
+
+    <button onclick="addProduct()">Add Product</button>
+
+    <hr>
+
+    <h2>All Products</h2>
+
+    <div id="products"></div>
+
+    <script src="admin.js"></script>
+</body>
+
+</html>
