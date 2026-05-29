@@ -12,9 +12,9 @@ app.use(express.json());
 // --------------------
 // MongoDB Connection
 // --------------------
-mongoose.connect("mongodb://127.0.0.1:27017/artstore")
-    .then(() => console.log("MongoDB Connected"))
-    .catch(err => console.log(err));
+//mongoose.connect("mongodb://127.0.0.1:27017/artstore")
+//    .then(() => console.log("MongoDB Connected"))
+  //  .catch(err => console.log(err));
 
 
 // File upload config
@@ -183,6 +183,8 @@ app.use(express.static("public"));
 // --------------------
 // Start Server
 // --------------------
-app.listen(3000, () => {
-    console.log("Server running on http://localhost:3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
 });
