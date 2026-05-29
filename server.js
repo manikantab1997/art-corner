@@ -16,6 +16,10 @@ app.use(express.json());
 //    .then(() => console.log("MongoDB Connected"))
   //  .catch(err => console.log(err));
 
+  mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB Connected"))
+  .catch(err => console.log(err));
+
 
 // File upload config
 const storage = multer.diskStorage({
