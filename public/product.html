@@ -8,21 +8,31 @@
 </head>
 
 <body>
-    <div class="navbar">
-        <button onclick="goBack()">⬅ Back</button>
 
-        <div class="nav-right">
-            <a href="index.html">🏠 Categories</a>
-            <a href="cart.html">🛒 Cart</a>
+    <div id="navbar-container"></div>
+
+    <div class="page-container">
+
+        <div id="product" class="card"></div>
+
+        <div style="text-align:center; margin-top:20px;">
+            <button id="addToCart">Add to Cart</button>
         </div>
-    </div>
-    <div id="product" class="card"></div>
 
-    <div style="text-align:center;">
-        <button id="addToCart">Add to Cart</button>
     </div>
 
+    <div id="footer-container"></div>
+
+<div class="bottom-nav">
+        <a href="index.html">🏠</a>
+        <a href="products.html?category=1">🛍️</a>
+        <a href="cart.html">🛒</a>
+        <a href="login.html">👤</a>
+    </div>
+
+    <script src="js/common.js"></script>
     <script src="product.js"></script>
+
 </body>
 
 </html>

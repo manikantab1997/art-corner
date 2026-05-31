@@ -9,38 +9,62 @@
 
 <body>
 
-    <!-- Navbar -->
-    <div class="navbar">
-        <button onclick="goBack()">⬅ Back</button>
-        <div class="nav-right">
-            <a href="index.html">🏠 Categories</a>
-            <a href="cart.html">🛒 Cart</a>
+    <div id="navbar-container"></div>
+
+    <div class="page-container">
+
+        <h1>Admin Panel</h1>
+
+        <div class="dashboard-actions">
+
+            <a href="dashboard.html" class="action-card">
+                📊 Dashboard
+            </a>
+
+            <a href="orders.html" class="action-card">
+                📦 Order History
+            </a>
+
         </div>
+
+        <div class="admin-form">
+
+            <h2>Add Product</h2>
+
+            <input id="name" placeholder="Product Name">
+
+            <input id="price" placeholder="Price">
+
+            <input id="category" placeholder="Category ID (1,2,3)">
+
+            <input type="file" id="image">
+
+            <button onclick="addProduct()">
+                Add Product
+            </button>
+
+        </div>
+
+        <hr>
+
+        <h2>All Products</h2>
+
+        <div id="products"></div>
+
     </div>
-    <h1>Admin Panel</h1>
-    <a href="dashboard.html">
-        <button>Dashboard</button>
-    </a>
-    
-    <a href="orders.html">
-        <button>View Order History</button>
-    </a>
-    <h2>Add Product</h2>
 
-    <input id="name" placeholder="Name"><br>
-    <input id="price" placeholder="Price"><br>
-    <input id="category" placeholder="Category ID (1,2,3)"><br>
-    <input type="file" id="image"><br>
+    <div id="footer-container"></div>
 
-    <button onclick="addProduct()">Add Product</button>
+<div class="bottom-nav">
+        <a href="index.html">🏠</a>
+        <a href="products.html?category=1">🛍️</a>
+        <a href="cart.html">🛒</a>
+        <a href="admin.html" class="active">⚙️</a>
+    </div>
 
-    <hr>
-
-    <h2>All Products</h2>
-
-    <div id="products"></div>
-
+    <script src="js/common.js"></script>
     <script src="admin.js"></script>
+
 </body>
 
 </html>

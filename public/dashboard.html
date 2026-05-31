@@ -9,32 +9,40 @@
 
 <body>
 
-    <!-- Navbar -->
-    <div class="navbar">
-        <button onclick="goBack()">⬅ Back</button>
-        <div class="nav-right">
-            <button onclick="logout()">Logout</button>
+    <div id="navbar-container"></div>
+
+    <div class="page-container">
+
+        <h1>Dashboard</h1>
+
+        <div class="dashboard-actions">
+
+            <a href="admin.html" class="action-card">
+                📦 Product Management
+            </a>
+
+            <a href="orders.html" class="action-card">
+                📑 Order Management
+            </a>
+
         </div>
+
+        <div id="stats" class="stats"></div>
+
     </div>
 
-    <h1>Dashboard</h1>
-    <div class="dashboard-actions">
-        <a href="admin.html" class="action-card">
-            📦 Product Management
-        </a>
+    <div id="footer-container"></div>
 
-        <a href="orders.html" class="action-card">
-            📑 Order Management
-        </a>
-    </div>
-    <div id="stats" class="stats"></div>
-    <div class="bottom-nav">
+<div class="bottom-nav">
         <a href="index.html">🏠</a>
         <a href="products.html?category=1">🛍️</a>
         <a href="cart.html">🛒</a>
-        <a href="login.html">👤</a>
+        <a href="admin.html" class="active">⚙️</a>
     </div>
+
+    <script src="js/common.js"></script>
     <script src="dashboard.js"></script>
+
 </body>
 
 </html>

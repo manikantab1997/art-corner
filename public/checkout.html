@@ -1,32 +1,50 @@
 <!DOCTYPE html>
 <html>
+
 <head>
   <title>Checkout</title>
   <link rel="stylesheet" href="style.css">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
+
 <body>
 
-  <!-- Navbar -->
-  <div class="navbar">
-    <button onclick="goBack()">⬅ Back</button>
-    <div class="nav-right">
-      <a href="index.html">🏠 Categories</a>
-      <a href="cart.html">🛒 Cart</a>
-    </div>
+  <div id="navbar-container"></div>
+
+  <div class="page-container">
+
+    <h1>Checkout</h1>
+
+    <form id="checkoutForm" class="checkout-form">
+
+      <input type="text" id="name" placeholder="Full Name" required>
+
+      <input type="text" id="phone" placeholder="Phone Number" required>
+
+      <input type="email" id="email" placeholder="Email Address" required>
+
+      <textarea id="address" placeholder="Shipping Address" required></textarea>
+
+      <button type="submit">
+        Place Order
+      </button>
+
+    </form>
+
   </div>
 
-  <h1>Checkout</h1>
+  <div id="footer-container"></div>
 
-  <form id="checkoutForm">
-    <input type="text" id="name" placeholder="Full Name" required /><br><br>
-    <input type="text" id="phone" placeholder="Phone Number" required /><br><br>
-    <input type="email" id="email" placeholder="Email" required /><br><br>
-    <textarea id="address" placeholder="Shipping Address" required></textarea><br><br>
+<div class="bottom-nav">
+    <a href="index.html">🏠</a>
+    <a href="products.html?category=1">🛍️</a>
+    <a href="cart.html">🛒</a>
+    <a href="login.html">👤</a>
+  </div>
 
-    <button type="submit">Place Order</button>
-  </form>
-
+  <script src="js/common.js"></script>
   <script src="checkout.js"></script>
+
 </body>
+
 </html>
