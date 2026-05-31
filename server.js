@@ -158,8 +158,13 @@ app.put("/api/products/:id", async (req, res) => {
 
 // Get all products (admin)
 app.get("/api/products", async (req, res) => {
-    const products = await Product.find();
+
+    const products = await Product.find({
+        inStock: true
+    });
+
     res.json(products);
+
 });
 
 // Get all orders (admin)

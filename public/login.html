@@ -8,22 +8,45 @@
 </head>
 
 <body>
+
     <div id="navbar-container"></div>
-    <h1>Admin Login</h1>
 
-    <input id="username" placeholder="Username"><br><br>
-    <input id="password" type="password" placeholder="Password"><br><br>
+    <div class="page-container">
 
-    <button onclick="login()">Login</button>
+        <div class="login-card">
+
+            <h1>🔐 Admin Login</h1>
+
+            <form id="loginForm">
+
+                <input id="username" placeholder="Username" autocomplete="username">
+
+                <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+
+                <p id="loginError" class="error-message"></p>
+
+                <button type="submit">
+                    Login
+                </button>
+
+            </form>
+
+        </div>
+
+    </div>
+
     <div id="footer-container"></div>
 
-<div class="bottom-nav">
+    <div class="bottom-nav">
         <a href="index.html">🏠</a>
-        <a href="products.html?category=1">🛍️</a>
+        <a href="products.html">🛍️</a>
         <a href="cart.html">🛒</a>
         <a href="login.html">👤</a>
     </div>
+
+    <script src="js/common.js"></script>
     <script src="login.js"></script>
+
 </body>
 
 </html>
