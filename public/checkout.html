@@ -14,6 +14,13 @@
   <div class="page-container">
 
     <h1>Checkout</h1>
+    <p id="checkoutFeedback" role="status" aria-live="polite"></p>
+
+    <section id="orderConfirmation" class="checkout-form" aria-live="polite" hidden>
+      <h2>Order confirmed</h2>
+      <p>Thank you. Your order ID is <strong id="orderConfirmationId"></strong>.</p>
+      <a href="products.html">Continue shopping</a>
+    </section>
 
     <form id="checkoutForm" class="checkout-form">
 
