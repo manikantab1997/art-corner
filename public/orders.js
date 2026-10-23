@@ -1,4 +1,4 @@
-if (localStorage.getItem("isAdmin") !== "true") window.location.href = "login.html";
+
 function goBack() { window.history.back(); }
 let allOrders = [];
 const tbody = document.querySelector("#ordersTable tbody");
@@ -48,4 +48,4 @@ function filterOrders() {
     String(order.customer?.name || "").toLowerCase().includes(query)
   ).filter(order => status === "all" || order.status === status));
 }
-loadOrders();
+requireAdminPage().then(isAdmin => { if (isAdmin) loadOrders(); });

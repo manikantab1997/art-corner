@@ -1,4 +1,4 @@
-if (localStorage.getItem("isAdmin") !== "true") window.location.href = "login.html";
+
 function goBack() { window.history.back(); }
 const productsContainer = document.getElementById("products");
 productsContainer.innerHTML = "<p role=\"status\">Loading products…</p>";
@@ -63,4 +63,4 @@ async function toggleStock(id) {
     await loadProducts();
   } catch (error) { alert(error.message); }
 }
-loadProducts();
+requireAdminPage().then(isAdmin => { if (isAdmin) loadProducts(); });

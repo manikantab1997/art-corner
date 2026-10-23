@@ -1,6 +1,6 @@
-if (localStorage.getItem("isAdmin") !== "true") window.location.href = "login.html";
+
 function goBack() { window.history.back(); }
-function logout() { localStorage.removeItem("isAdmin"); window.location.href = "login.html"; }
+
 const stats = document.getElementById("stats");
 stats.innerHTML = "<p role=\"status\">Loading dashboard…</p>";
 async function loadStats() {
@@ -15,4 +15,4 @@ async function loadStats() {
     stats.innerHTML = "<p role=\"alert\">Dashboard data is temporarily unavailable. Please refresh.</p>";
   }
 }
-loadStats();
+requireAdminPage().then(isAdmin => { if (isAdmin) loadStats(); });

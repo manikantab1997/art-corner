@@ -1,39 +1,28 @@
-function login() {
+const loginForm = document.getElementById("loginForm");
+const loginError = document.getElementById("loginError");
 
-  const username =
-    document.getElementById("username").value.trim();
+loginForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = loginForm.querySelector('[type="submit"]');
+  const username = document.getElementById("username").value.trim();
+  const password = document.getElementById("password").value;
+  loginError.textContent = "";
+  button.disabled = true;
 
-  const password =
-    document.getElementById("password").value.trim();
-
-  const error =
-    document.getElementById("loginError");
-
-  error.innerText = "";
-
-  if (
-    username === "admin" &&
-    password === "1234"
-  ) {
-
-    localStorage.setItem("isAdmin", "true");
-
+  try {
+    const response = await fetch("/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ username, password })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Login failed. Please try again.");
+    if (result.authenticated !== true) throw new Error("Login was not confirmed by the server.");
     window.location.href = "dashboard.html";
-
-  } else {
-
-    error.innerText =
-      "❌ Invalid username or password";
-
+  } catch (error) {
+    loginError.textContent = error.message || "Unable to sign in. Please try again.";
+  } finally {
+    button.disabled = false;
   }
-}
-
-document
-  .getElementById("loginForm")
-  .addEventListener("submit", function (e) {
-
-    e.preventDefault();
-
-    login();
-
-  });
+});
