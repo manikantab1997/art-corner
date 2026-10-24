@@ -2,8 +2,8 @@ const categoriesContainer = document.getElementById("categories");
 const categoriesStatus = document.getElementById("home-category-status");
 const productsContainer = document.getElementById("featured-products");
 const productsStatus = document.getElementById("home-products-status");
-const heroImage = document.getElementById("hero-product-image");
-const heroImageCaption = document.getElementById("hero-image-caption");
+const heroCollage = document.getElementById("hero-product-collage");
+const heroCollageStatus = document.getElementById("hero-collage-status");
 
 async function fetchHomeData(url, label) {
   const response = await fetch(url);
@@ -17,8 +17,8 @@ function isLocalPreviewProduct(product) {
   return typeof product?.name === "string" && product.name.startsWith("[LOCAL PREVIEW] ");
 }
 
-function getProductImageSource(product) {
-  const savedImage = typeof product?.image === "string" ? product.image.trim() : "";
+function getSavedProductImageSource(value) {
+  const savedImage = typeof value === "string" ? value.trim() : "";
   if (savedImage.startsWith("/") && !savedImage.startsWith("//") && !savedImage.includes("\\") &&
       !savedImage.split(/[?#]/, 1)[0].split("/").includes("..")) {
     return savedImage;
@@ -30,11 +30,65 @@ function getProductImageSource(product) {
       // Invalid or unsupported image values use the existing placeholder.
     }
   }
+  return "";
+}
 
+function getProductImageSource(product) {
+  const savedImage = getSavedProductImageSource(product?.image);
+  if (savedImage) return savedImage;
   if (isLocalPreviewProduct(product) && Number(product.categoryId) === 1) {
     return "/uploads/candle.jpg";
   }
   return "";
+}
+
+function renderHeroCollage(products) {
+  heroCollage.replaceChildren(heroCollageStatus);
+  heroCollageStatus.hidden = false;
+  const featured = products
+    .map(product => ({ product, imageSource: getSavedProductImageSource(product?.image) }))
+    .filter(item => item.imageSource)
+    .slice(0, 3);
+
+  if (!featured.length) {
+    heroCollageStatus.textContent = "Product photos will appear here when available.";
+    return;
+  }
+
+  let pendingImages = featured.length;
+  let visibleImages = 0;
+  featured.forEach(({ product, imageSource }, index) => {
+    const tile = document.createElement("a");
+    tile.className = "hero-collage-tile";
+    tile.href = `product.html?id=${encodeURIComponent(product._id)}`;
+    tile.setAttribute("aria-label", `View ${product.name || "handmade product"}`);
+    tile.hidden = true;
+
+    const image = document.createElement("img");
+    image.alt = product.name || "Handmade product";
+    image.loading = index === 0 ? "eager" : "lazy";
+    image.decoding = "async";
+    image.addEventListener("load", () => {
+      tile.hidden = false;
+      visibleImages += 1;
+      pendingImages -= 1;
+      heroCollageStatus.hidden = true;
+    });
+    image.addEventListener("error", () => {
+      tile.remove();
+      pendingImages -= 1;
+      if (pendingImages === 0 && visibleImages === 0) {
+        heroCollageStatus.hidden = false;
+        heroCollageStatus.textContent = "Product photos are temporarily unavailable.";
+      }
+    });
+    const caption = document.createElement("span");
+    caption.className = "hero-collage-caption";
+    caption.textContent = product.name || "Handmade favourite";
+    tile.append(image, caption);
+    heroCollage.appendChild(tile);
+    image.src = imageSource;
+  });
 }
 
 function makeCategoryCard({ name, href, product, index, allProducts = false }) {
@@ -181,12 +235,7 @@ async function loadHomePage() {
 
   if (productResult.status === "fulfilled") {
     renderFeaturedProducts(products);
-    const heroImageSource = getProductImageSource(products[0]);
-    if (heroImageSource) {
-      heroImage.addEventListener("load", () => { heroImage.hidden = false; });
-      heroImage.src = heroImageSource;
-      if (products[0].name) heroImageCaption.textContent = products[0].name;
-    }
+    renderHeroCollage(products);
   } else {
     console.error("Featured product request failed:", productResult.reason);
     productsStatus.textContent = "Products are temporarily unavailable. Please try again shortly.";

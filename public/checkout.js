@@ -5,6 +5,16 @@ const confirmation = document.getElementById("orderConfirmation");
 const confirmationId = document.getElementById("orderConfirmationId");
 const orderIdFromUrl = new URLSearchParams(window.location.search).get("orderId");
 const validOrderId = value => /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value || "");
+const checkoutKeyName = "artcorner.checkout.idempotencyKey";
+function getCheckoutIdempotencyKey() {
+  let key = sessionStorage.getItem(checkoutKeyName);
+  if (!key) {
+    if (typeof crypto === "undefined" || typeof crypto.randomUUID !== "function") throw new Error("Secure checkout is unavailable in this browser. Please try a current browser.");
+    key = crypto.randomUUID();
+    sessionStorage.setItem(checkoutKeyName, key);
+  }
+  return key;
+}
 
 if (validOrderId(orderIdFromUrl)) {
   form.hidden = true;
@@ -35,7 +45,7 @@ if (validOrderId(orderIdFromUrl)) {
     try {
       const response = await fetch("/api/orders", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": getCheckoutIdempotencyKey() },
         body: JSON.stringify(orderData)
       });
       const data = await response.json().catch(() => ({}));
@@ -44,6 +54,7 @@ if (validOrderId(orderIdFromUrl)) {
         throw new Error("The server did not confirm your order. Your cart is still saved; please check before trying again.");
       }
       localStorage.removeItem("cart");
+      sessionStorage.removeItem(checkoutKeyName);
       window.location.href = `checkout.html?orderId=${encodeURIComponent(data.orderId)}`;
     } catch (error) {
       feedback.textContent = error.message || "Unable to reach the store. Your cart is saved; please try again.";

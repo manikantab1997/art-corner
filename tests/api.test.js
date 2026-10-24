@@ -25,7 +25,7 @@ function routeStack(method, routePath, target = app) {
   assert.ok(layer, `${method} ${routePath} route exists`);
   return layer.route.stack.map(item => item.handle);
 }
-async function invoke(handler, { params = {}, body = {}, file, reqSession = {} } = {}) {
+async function invoke(handler, { params = {}, body = {}, file, reqSession = {}, headers = {} } = {}) {
   const result = { statusCode: 200, body: undefined, clearedCookie: null, ended: false };
   const res = {
     status(code) { result.statusCode = code; return this; },
@@ -33,7 +33,7 @@ async function invoke(handler, { params = {}, body = {}, file, reqSession = {} }
     clearCookie(name, options) { result.clearedCookie = { name, options }; return this; },
     end() { result.ended = true; return this; }
   };
-  await handler({ params, body, file, session: reqSession }, res);
+  await handler({ params, body, file, session: reqSession, headers, get: name => headers[name.toLowerCase()] }, res);
   return result;
 }
 const testSalt = randomBytes(16);
@@ -257,8 +257,16 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", qty
   };
   const document = { getElementById: id => nodes[id] };
   const source = fs.readFileSync(path.join(__dirname, "../public/checkout.js"), "utf8");
-  vm.runInNewContext(source, { document, window, localStorage, fetch: fetchImpl, console, URLSearchParams });
-  return { nodes, window, storage };
+  const sessionStorage = {
+    getItem: key => storage.has(key) ? storage.get(key) : null,
+    setItem: (key, value) => storage.set(key, value),
+    removeItem: key => storage.delete(key)
+  };
+  vm.runInNewContext(source, {
+    document, window, localStorage, sessionStorage, fetch: fetchImpl, console, URLSearchParams,
+    crypto: { randomUUID: () => "123e4567-e89b-42d3-a456-426614174000" }
+  });
+  return { nodes, window, storage, sessionStorage };
 }
 function uiElement(tagName = "div") {
   return {
@@ -289,7 +297,8 @@ async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = 
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" } };
   const document = {
     getElementById: id => nodes[id] || null,
-    createElement: tag => uiElement(tag)
+    createElement: tag => uiElement(tag),
+    createTextNode: text => Object.assign(uiElement("#text"), { textContent: text })
   };
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
@@ -342,13 +351,173 @@ test("POST /api/orders returns a persisted order ID in a success response", asyn
   Order.prototype.save = async function () { return this; };
   try {
     const response = await invoke(routeStack("post", "/api/orders").at(-1), {
-      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] }
+      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] },
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(response.statusCode, 201);
     assert.match(response.body.orderId, /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    const missingKey = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] }
+    });
+    assert.equal(missingKey.statusCode, 400);
   } finally {
     Order.prototype.save = originalSave;
   }
+});
+test("WhatsApp Cloud API uses an approved template with order details and does not expose provider errors", async () => {
+  const { getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification } = require("../server");
+  const env = {
+    WHATSAPP_ACCESS_TOKEN: "test-token-never-logged", WHATSAPP_PHONE_NUMBER_ID: "1234567890",
+    WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_TEMPLATE_NAME: "new_order_notice"
+  };
+  const config = getWhatsAppConfig(env);
+  const payload = buildWhatsAppOrderPayload({
+    _id: "order-ref", orderId: "ORD-test", items: [{ name: "Candle", price: 250, qty: 2 }]
+  }, config);
+  assert.deepEqual(payload.template.components[0].parameters.map(parameter => parameter.text), ["ORD-test", "Candle × 2", "500.00", "order-ref"]);
+  let requestOptions;
+  const sent = await sendWhatsAppOrderNotification({
+    _id: "order-ref", orderId: "ORD-test", items: [{ name: "Candle", price: 250, qty: 2 }]
+  }, { env, fetchImpl: async (url, options) => {
+    assert.match(url, /^https:\/\/graph\.facebook\.com\/v\d+\.\d+\/1234567890\/messages$/);
+    requestOptions = options;
+    return { ok: true, json: async () => ({ messages: [{ id: "meta-message-id" }] }) };
+  } });
+  assert.equal(sent.status, "sent");
+  assert.equal(sent.messageId, "meta-message-id");
+  assert.match(requestOptions.headers.Authorization, /^Bearer /);
+  const failed = await sendWhatsAppOrderNotification({}, { env, fetchImpl: async () => ({ ok: false, json: async () => ({ error: { message: "provider secret details" } }) }) });
+  assert.deepEqual(failed, { status: "failed" });
+  const ambiguous = await sendWhatsAppOrderNotification({}, { env, fetchImpl: async () => { throw new Error("private network details"); } });
+  assert.deepEqual(ambiguous, { status: "unknown" });
+  assert.equal(getWhatsAppConfig({}), null);
+  assert.throws(() => getWhatsAppConfig({ ...env, WHATSAPP_TEMPLATE_NAME: undefined }), /incomplete/);
+});
+
+test("order persistence succeeds when WhatsApp notification fails and happens only after save", async () => {
+  let saved = false;
+  let recordedStatus;
+  const originalSave = Order.prototype.save;
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalUpdateOne = Order.updateOne;
+  let persistedOrder;
+  Order.prototype.save = async function () { saved = true; this._id = "saved-order-ref"; persistedOrder = this; return this; };
+  Order.findOne = async () => persistedOrder;
+  Order.findOneAndUpdate = async (_filter, update) => ({
+    _id: "saved-order-ref", orderId: "ORD-test", items: [], ...update.$set
+  });
+  Order.updateOne = async (_filter, update) => {
+    assert.equal(saved, true, "notification runs only after order persistence");
+    recordedStatus = update.$set.whatsappNotificationStatus;
+    return { modifiedCount: 1 };
+  };
+  const configuredEnv = {
+    WHATSAPP_ACCESS_TOKEN: "test-token", WHATSAPP_PHONE_NUMBER_ID: "1234567890",
+    WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_TEMPLATE_NAME: "new_order_notice"
+  };
+  try {
+    const testOrderApp = createApp({
+      storefrontOrigin: "http://localhost:3000", whatsappEnv: configuredEnv,
+      whatsappFetch: async () => {
+        assert.equal(saved, true, "WhatsApp request begins only after the order is saved");
+        throw new Error("test-only network failure");
+      }
+    });
+    const handler = routeStack("post", "/api/orders", testOrderApp).at(-1);
+    const response = await invoke(handler, {
+      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] },
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(response.statusCode, 201);
+    assert.match(response.body.orderId, /^ORD-/);
+    assert.equal(saved, true);
+    assert.equal(recordedStatus, "unknown", "ambiguous provider failure is recorded for reconciliation");
+  } finally {
+    Order.prototype.save = originalSave;
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    Order.updateOne = originalUpdateOne;
+  }
+});
+test("checkout idempotency returns the existing order without sending a second notification", async () => {
+  const originalSave = Order.prototype.save;
+  const originalFindOne = Order.findOne;
+  const savedPayload = { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] };
+  const requestHash = require("node:crypto").createHash("sha256").update(JSON.stringify(savedPayload)).digest("hex");
+  Order.prototype.save = async function () { const error = new Error("duplicate key"); error.code = 11000; throw error; };
+  let lookupFilter;
+  Order.findOne = filter => {
+    lookupFilter = filter;
+    return { select: async () => ({ orderId: "ORD-existing", requestHash }) };
+  };
+  try {
+    const response = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: savedPayload, headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, { orderId: "ORD-existing" });
+    assert.equal(lookupFilter.idempotencyKey, "123e4567-e89b-42d3-a456-426614174000");
+    const conflict = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: { ...savedPayload, items: [{ name: "Changed item", price: 10, qty: 1 }] },
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(conflict.statusCode, 409);
+  } finally {
+    Order.prototype.save = originalSave;
+    Order.findOne = originalFindOne;
+  }
+});
+
+test("product customization defaults off and admin can persist an explicit setting", async () => {
+  assert.equal(new Product().customizationEnabled, false);
+  const originalFindById = Product.findById;
+  const product = { customizationEnabled: false, save: async function () { this.saved = true; return this; } };
+  Product.findById = async () => product;
+  try {
+    const response = await invoke(routeStack("put", "/api/products/:id").at(-1), {
+      params: { id: "507f1f77bcf86cd799439011" }, body: { customizationEnabled: true }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(product.customizationEnabled, true);
+    assert.equal(product.saved, true);
+    const invalid = await invoke(routeStack("put", "/api/products/:id").at(-1), {
+      params: { id: "507f1f77bcf86cd799439011" }, body: { customizationEnabled: "true" }
+    });
+    assert.equal(invalid.statusCode, 400);
+  } finally { Product.findById = originalFindById; }
+});
+
+test("product customization links are conditional and use the configured business profiles", async () => {
+  const enabledNodes = { product: uiElement("div"), addToCart: uiElement("button") };
+  await runBrowserScript("public/product.js", {
+    nodes: enabledNodes, search: "?id=p1",
+    fetchImpl: async () => ({ ok: true, json: async () => ({ _id: "p1", name: "Candle & Rose", price: 20, inStock: true, customizationEnabled: true }) })
+  });
+  const section = enabledNodes.product.children.find(child => child.className === "product-customization");
+  assert.ok(section, "enabled products show customization actions");
+  const links = section.children[2].children;
+  assert.equal(links[0].href, `https://wa.me/919380125087?text=${encodeURIComponent("Hi, I'd like to ask about customizing Candle & Rose. Could you share the available options?")}`);
+  assert.equal(links[1].href, "https://www.instagram.com/art_corner_blr/");
+  for (const link of links) {
+    assert.equal(link.target, "_blank");
+    assert.equal(link.rel, "noopener noreferrer");
+    assert.ok(link.attributes["aria-label"]);
+  }
+  const disabledNodes = { product: uiElement("div"), addToCart: uiElement("button") };
+  await runBrowserScript("public/product.js", {
+    nodes: disabledNodes, search: "?id=p2",
+    fetchImpl: async () => ({ ok: true, json: async () => ({ _id: "p2", name: "Ordinary", price: 20, inStock: true, customizationEnabled: false }) })
+  });
+  assert.equal(disabledNodes.product.children.some(child => child.className === "product-customization"), false);
+});
+
+test("public footer uses the exact business profiles with accessible external links", () => {
+  const footer = fs.readFileSync(path.join(__dirname, "../public/components/footer.html"), "utf8");
+  assert.match(footer, /https:\/\/www\.instagram\.com\/art_corner_blr\//);
+  assert.match(footer, /https:\/\/wa\.me\/919380125087/);
+  assert.doesNotMatch(footer, /wa\.me\/919999999999|href="https?:\/\/instagram\.com"/);
+  assert.match(footer, /target="_blank" rel="noopener noreferrer" aria-label=/);
 });
 test("checkout clears cart only after a confirmed response and redirects to the confirmation URL", async () => {
   const browser = checkoutBrowser();
@@ -361,6 +530,25 @@ test("checkout failure preserves cart and shows an error", async () => {
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.checkoutFeedback.textContent, /Order save failed/);
+});
+test("checkout reuses its idempotency key after a failed request and clears it only on confirmed success", async () => {
+  let postedKey;
+  const failed = checkoutBrowser({ fetchImpl: async (_url, options) => {
+    postedKey = options.headers["Idempotency-Key"];
+    return { ok: false, json: async () => ({ error: "Temporary failure" }) };
+  } });
+  await failed.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(postedKey, "123e4567-e89b-42d3-a456-426614174000");
+  assert.equal(failed.storage.has("cart"), true);
+  assert.equal(failed.storage.get("artcorner.checkout.idempotencyKey"), postedKey);
+  const succeeded = checkoutBrowser({ fetchImpl: async (_url, options) => {
+    assert.equal(options.headers["Idempotency-Key"], postedKey);
+    return { ok: true, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000" }) };
+  } });
+  succeeded.storage.set("artcorner.checkout.idempotencyKey", postedKey);
+  await succeeded.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(succeeded.storage.has("cart"), false);
+  assert.equal(succeeded.storage.has("artcorner.checkout.idempotencyKey"), false);
 });
 test("refreshing an order confirmation shows the ID without attaching a submit handler", () => {
   const orderId = "ORD-123e4567-e89b-42d3-a456-426614174000";
@@ -419,7 +607,7 @@ test("HTTP login rejects incorrect credentials and oversized passwords", async (
 });
 test("HTTP admin APIs reject requests without an authenticated session", async () => {
   await withHttpApp(async ({ request }) => {
-    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/not-an-id"], ["PUT", "/api/products/not-an-id"], ["GET", "/api/orders"], ["PUT", "/api/orders/ORD-test"]]) {
+    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/not-an-id"], ["PUT", "/api/products/not-an-id"], ["GET", "/api/orders"], ["PUT", "/api/orders/ORD-test"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"]]) {
       const result = await request(routePath, { method });
       assert.equal(result.response.status, 401, `${method} ${routePath}`);
       assert.match(result.text, /Authentication required/);
@@ -517,6 +705,8 @@ test("HTTP cookie authorizes protected API and logout invalidates it", async () 
       const authorized = await request("/api/orders", { cookie });
       assert.equal(authorized.response.status, 200);
       assert.equal(JSON.parse(authorized.text)[0].orderId, "ORD-test");
+      const retryWhenUnconfigured = await request("/api/admin/orders/ORD-test/whatsapp-notification/retry", { method: "POST", cookie, origin: testOrigin });
+      assert.equal(retryWhenUnconfigured.response.status, 503, "authenticated request reaches retry handling but sends nothing without config");
       const logout = await request("/api/admin/logout", { method: "POST", cookie });
       assert.equal(logout.response.status, 204);
       assert.match(logout.setCookies.join(";"), /artcorner\.sid=;/);
@@ -525,7 +715,7 @@ test("HTTP cookie authorizes protected API and logout invalidates it", async () 
     } finally {
       Order.find = originalFind;
     }
-  });
+  }, { whatsappEnv: {} });
 });
 test("HTTP admin state changes reject untrusted and missing origins", async () => {
   await withHttpApp(async ({ request }) => {
@@ -540,7 +730,7 @@ test("HTTP admin state changes reject untrusted and missing origins", async () =
       body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
     });
     const cookie = sessionCookie(login.setCookies);
-    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/invalid"], ["PUT", "/api/products/invalid"], ["PUT", "/api/orders/ORD-test"], ["POST", "/api/admin/logout"]]) {
+    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/invalid"], ["PUT", "/api/products/invalid"], ["PUT", "/api/orders/ORD-test"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"], ["POST", "/api/admin/logout"]]) {
       const result = await request(routePath, { method, cookie, origin: "https://evil.storefront.example.test" });
       assert.equal(result.response.status, 403, `${method} ${routePath}`);
     }
@@ -789,8 +979,8 @@ test("homepage renders API-driven collection cards and real in-stock featured pr
     "home-category-status": uiElement("p"),
     "featured-products": uiElement("div"),
     "home-products-status": uiElement("p"),
-    "hero-product-image": uiElement("img"),
-    "hero-image-caption": uiElement("span")
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
   };
   const success = await runBrowserScript("public/script.js", {
     nodes,
@@ -805,7 +995,7 @@ test("homepage renders API-driven collection cards and real in-stock featured pr
   assert.equal(success.nodes.categories.children[1].children[0].children[1].src, "/uploads/candle.jpg");
   assert.equal(success.nodes["featured-products"].children.length, 1, "out-of-stock products stay hidden");
   assert.equal(success.nodes["featured-products"].children[0].children[1].children[0].textContent, "Tree Candle");
-  assert.equal(success.nodes["hero-product-image"].src, "/uploads/candle.jpg");
+  assert.equal(success.nodes["hero-product-collage"].children[1].children[0].src, "/uploads/candle.jpg");
 });
 test("homepage uses saved HTTPS product images and neutral placeholders for ordinary products", async () => {
   const nodes = {
@@ -813,8 +1003,8 @@ test("homepage uses saved HTTPS product images and neutral placeholders for ordi
     "home-category-status": uiElement("p"),
     "featured-products": uiElement("div"),
     "home-products-status": uiElement("p"),
-    "hero-product-image": uiElement("img"),
-    "hero-image-caption": uiElement("span")
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
   };
   const products = [
     { _id: "cloud", name: "Cloudinary item", categoryId: 4, price: 10, image: "https://res.cloudinary.com/example/image/upload/item.jpg", inStock: true },
@@ -827,6 +1017,7 @@ test("homepage uses saved HTTPS product images and neutral placeholders for ordi
   });
   const cards = result.nodes["featured-products"].children;
   assert.equal(cards[0].children[0].children[0].src, products[0].image);
+  assert.equal(result.nodes["hero-product-collage"].children[1].children[0].src, products[0].image, "hero collage uses the saved Cloudinary HTTPS URL");
   assert.equal(cards[0].children[0].children[1].hidden, false);
   cards[0].children[0].children[0].handlers.error();
   assert.equal(cards[0].children[0].children[0].removed, true);
@@ -842,8 +1033,8 @@ test("category-specific preview illustrations are limited to labeled local sampl
     "home-category-status": uiElement("p"),
     "featured-products": uiElement("div"),
     "home-products-status": uiElement("p"),
-    "hero-product-image": uiElement("img"),
-    "hero-image-caption": uiElement("span")
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
   };
   const products = [
     { _id: "candle", name: "[LOCAL PREVIEW] Sample Candle", categoryId: 1, price: 10, image: "", inStock: true },
@@ -869,8 +1060,8 @@ test("homepage keeps useful API failure and empty states without inventing produ
     "home-category-status": uiElement("p"),
     "featured-products": uiElement("div"),
     "home-products-status": uiElement("p"),
-    "hero-product-image": uiElement("img"),
-    "hero-image-caption": uiElement("span")
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
   };
   const failed = await runBrowserScript("public/script.js", {
     nodes,
@@ -886,8 +1077,8 @@ test("homepage keeps useful API failure and empty states without inventing produ
     "home-category-status": uiElement("p"),
     "featured-products": uiElement("div"),
     "home-products-status": uiElement("p"),
-    "hero-product-image": uiElement("img"),
-    "hero-image-caption": uiElement("span")
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
   };
   const empty = await runBrowserScript("public/script.js", {
     nodes: emptyNodes,
@@ -1105,8 +1296,9 @@ test("admin UI continues to load the protected product-list API", async () => {
       requested.push(url);
       if (url === "/api/categories") return { ok: true, json: async () => legacyCategoryFixtures };
       if (url === "/api/admin/products") return { ok: true, json: async () => [{
-        _id: "product-1", name: "Candle", price: 250, image: "/uploads/candle.jpg", inStock: false
+        _id: "product-1", name: "Candle", price: 250, image: "/uploads/candle.jpg", inStock: false, customizationEnabled: false
       }] };
+      if (url === "/api/products/product-1") return { ok: true, json: async () => ({}) };
       return { ok: true, json: async () => ({}) };
     },
     requireAdminPage: async () => true
@@ -1114,6 +1306,14 @@ test("admin UI continues to load the protected product-list API", async () => {
   assert.ok(requested.includes("/api/admin/products"));
   assert.equal(nodes.products.children.length, 1);
   assert.match(nodes.products.children[0].innerHTML, /Out of Stock/);
+  const source = fs.readFileSync(path.join(__dirname, "../public/admin.html"), "utf8");
+  assert.match(source, /id="customizationEnabled"/);
+  const checkbox = nodes.products.children[0].children.find(child => child.className === "admin-product-customization").children[0];
+  assert.equal(checkbox.checked, false, "existing products default to customization disabled");
+  checkbox.checked = true;
+  checkbox.handlers.change();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(requested.includes("/api/products/product-1"));
 });
 test("HTTP CORS only names the configured storefront and does not enable credentials", async () => {
   await withCategoryMocks(async () => withHttpApp(async ({ request }) => {

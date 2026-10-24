@@ -9,7 +9,7 @@ const mongoose = require("mongoose");
 const session = require("express-session");
 const { MongoStore } = require("connect-mongo");
 const { rateLimit } = require("express-rate-limit");
-const { randomUUID, randomBytes, scrypt, timingSafeEqual } = require("crypto");
+const { randomUUID, randomBytes, createHash, scrypt, timingSafeEqual } = require("crypto");
 const { promisify } = require("util");
 
 const scryptAsync = promisify(scrypt);
@@ -69,7 +69,21 @@ const orderSchema = new mongoose.Schema({
     customer: { name: String, phone: String, email: String, address: String },
     items: Array,
     status: String,
-    createdAt: { type: Date, default: Date.now }
+    createdAt: { type: Date, default: Date.now },
+    idempotencyKey: { type: String, select: false },
+    requestHash: { type: String, select: false },
+    whatsappNotificationStatus: {
+        type: String,
+        enum: ["pending", "sending", "sent", "failed", "unknown", "not_configured"],
+        default: "not_configured"
+    },
+    whatsappNotificationAttempts: { type: Number, default: 0 },
+    whatsappNotificationAttemptedAt: Date,
+    whatsappNotificationMessageId: String
+});
+orderSchema.index({ idempotencyKey: 1 }, {
+    unique: true,
+    partialFilterExpression: { idempotencyKey: { $type: "string" } }
 });
 const Order = mongoose.model("Order", orderSchema);
 
@@ -97,6 +111,7 @@ const productSchema = new mongoose.Schema({
     price: Number,
     image: String,
     imagePublicId: { type: String, select: false, default: undefined },
+    customizationEnabled: { type: Boolean, default: false },
     inStock: { type: Boolean, default: true }
 });
 const Product = mongoose.model("Product", productSchema);
@@ -177,6 +192,103 @@ function publicCategory(category) {
     return { id: category.id, name: category.name, image: category.image || null };
 }
 
+function getWhatsAppConfig(env = process.env) {
+    const required = ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_BUSINESS_RECIPIENT", "WHATSAPP_TEMPLATE_NAME"];
+    const configured = required.filter(key => typeof env[key] === "string" && env[key].trim());
+    if (configured.length === 0) return null;
+    if (configured.length !== required.length) throw new Error("WhatsApp notification configuration is incomplete");
+    const config = {
+        accessToken: env.WHATSAPP_ACCESS_TOKEN.trim(),
+        phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID.trim(),
+        recipient: env.WHATSAPP_BUSINESS_RECIPIENT.trim(),
+        templateName: env.WHATSAPP_TEMPLATE_NAME.trim(),
+        apiVersion: env.WHATSAPP_API_VERSION || "v23.0",
+        language: env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US"
+    };
+    if (!/^\d+$/.test(config.phoneNumberId) || !/^\d{8,15}$/.test(config.recipient) ||
+        !/^[a-z0-9_]{1,512}$/.test(config.templateName) || !/^v\d+\.\d+$/.test(config.apiVersion) ||
+        !/^[a-z]{2}_[A-Z]{2}$/.test(config.language)) {
+        throw new Error("WhatsApp notification configuration is invalid");
+    }
+    return config;
+}
+
+function buildWhatsAppOrderPayload(order, config) {
+    const items = Array.isArray(order.items) ? order.items : [];
+    const itemText = items.map(item => `${String(item.name || "Item").slice(0, 80)} × ${Number(item.qty ?? item.quantity) || 0}`).join(", ").slice(0, 900) || "No item details";
+    const total = items.every(item => Number.isFinite(Number(item.price)) && Number.isFinite(Number(item.qty ?? item.quantity)))
+        ? items.reduce((sum, item) => sum + Number(item.price) * Number(item.qty ?? item.quantity), 0)
+        : null;
+    const components = [String(order.orderId).slice(0, 100), itemText, total === null ? "Not available" : total.toFixed(2), String(order._id).slice(0, 100)];
+    return {
+        messaging_product: "whatsapp", recipient_type: "individual", to: config.recipient,
+        type: "template",
+        template: {
+            name: config.templateName, language: { code: config.language },
+            components: [{ type: "body", parameters: components.map(text => ({ type: "text", text })) }]
+        }
+    };
+}
+
+async function sendWhatsAppOrderNotification(order, { env = process.env, fetchImpl = globalThis.fetch } = {}) {
+    const config = getWhatsAppConfig(env);
+    if (!config) return { status: "not_configured" };
+    if (typeof fetchImpl !== "function") return { status: "failed" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+        const response = await fetchImpl(`https://graph.facebook.com/${config.apiVersion}/${config.phoneNumberId}/messages`, {
+            method: "POST", signal: controller.signal,
+            headers: { Authorization: `Bearer ${config.accessToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify(buildWhatsAppOrderPayload(order, config))
+        });
+        if (!response.ok) return { status: response.status >= 500 ? "unknown" : "failed" };
+        const data = await response.json().catch(() => ({}));
+        return { status: "sent", messageId: typeof data.messages?.[0]?.id === "string" ? data.messages[0].id : undefined };
+    } catch {
+        // A network failure is ambiguous: Meta may have accepted the request.
+        return { status: "unknown" };
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function processOrderWhatsAppNotification(orderId, { retry = false, env = process.env, fetchImpl = globalThis.fetch } = {}) {
+    let config;
+    try { config = getWhatsAppConfig(env); }
+    catch { return { status: "not_configured" }; }
+    if (!config) return { status: "not_configured" };
+    const order = await Order.findOne({ orderId });
+    if (!order) return { status: "not_found" };
+    const allowed = retry ? ["failed", "not_configured", "pending"] : ["pending"];
+    const claimed = await Order.findOneAndUpdate(
+        { orderId, whatsappNotificationStatus: { $in: allowed } },
+        { $set: { whatsappNotificationStatus: "sending", whatsappNotificationAttemptedAt: new Date() }, $inc: { whatsappNotificationAttempts: 1 } },
+        { new: true }
+    );
+    if (!claimed) {
+        const current = await Order.findOne({ orderId });
+        return { status: current?.whatsappNotificationStatus || "sending" };
+    }
+    const outcome = await sendWhatsAppOrderNotification(claimed, { env, fetchImpl });
+    try {
+        const updateResult = await Order.updateOne({ orderId, whatsappNotificationStatus: "sending" }, {
+            $set: {
+                whatsappNotificationStatus: outcome.status,
+                ...(outcome.messageId ? { whatsappNotificationMessageId: outcome.messageId } : {})
+            }
+        });
+        if (updateResult.matchedCount === 0 || updateResult.modifiedCount === 0) {
+            console.error("WhatsApp notification outcome could not be saved; reconciliation is required");
+            return { status: "unknown" };
+        }
+    } catch {
+        console.error("WhatsApp notification outcome could not be saved; reconciliation is required");
+        return { status: "unknown" };
+    }
+    return outcome;
+}
+
 function parsePasswordHash(encoded) {
     if (typeof encoded !== "string") return null;
     const match = /^scrypt\$([a-f\d]{32})\$([a-f\d]{128})$/i.exec(encoded);
@@ -214,7 +326,9 @@ function createApp({
     storefrontOrigin = process.env.STOREFRONT_ORIGIN || (production ? null : "http://localhost:3000"),
     rateLimitStore,
     cloudinaryClient = cloudinary,
-    cloudinaryConfigured = cloudinaryConfigMissing().length === 0
+    cloudinaryConfigured = cloudinaryConfigMissing().length === 0,
+    whatsappEnv = process.env,
+    whatsappFetch = globalThis.fetch
 } = {}) {
     const app = express();
     const trustedStorefrontOrigin = validateStorefrontOrigin(storefrontOrigin, { production });
@@ -481,6 +595,9 @@ function createApp({
         if (!Number.isInteger(categoryId) || categoryId <= 0) {
             return res.status(400).json({ error: "categoryId must be a positive integer" });
         }
+        if (req.body.customizationEnabled !== undefined && !["true", "false"].includes(req.body.customizationEnabled)) {
+            return res.status(400).json({ error: "customizationEnabled must be true or false" });
+        }
         if (!req.file) {
             return res.status(400).json({ error: "A product image is required" });
         }
@@ -514,7 +631,8 @@ function createApp({
         let product;
         try {
             product = await new Product({
-                name, price, categoryId, image: uploadedImage.secureUrl, imagePublicId: uploadedImage.publicId
+                name, price, categoryId, image: uploadedImage.secureUrl, imagePublicId: uploadedImage.publicId,
+                customizationEnabled: req.body.customizationEnabled === "true"
             }).save();
         } catch (error) {
             // A rejected database save can have an ambiguous commit result. Retain
@@ -544,13 +662,46 @@ function createApp({
     });
 
     app.post("/api/orders", async (req, res) => {
+        const idempotencyKey = req.get?.("Idempotency-Key") || req.headers?.["idempotency-key"];
+        if (idempotencyKey === undefined) {
+            return res.status(400).json({ error: "Checkout key is missing. Refresh checkout and try again." });
+        }
+        if (idempotencyKey !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
+            return res.status(400).json({ error: "Idempotency-Key must be a UUID v4" });
+        }
+        const requestHash = createHash("sha256").update(JSON.stringify(req.body || {})).digest("hex");
         try {
             const orderId = `ORD-${randomUUID()}`;
-            const newOrder = new Order({ ...req.body, orderId, status: "Placed" });
+            let initialNotificationStatus = "pending";
+            try { if (!getWhatsAppConfig(whatsappEnv)) initialNotificationStatus = "not_configured"; }
+            catch { initialNotificationStatus = "not_configured"; }
+            const newOrder = new Order({
+                ...req.body, orderId, status: "Placed",
+                ...(idempotencyKey ? { idempotencyKey, requestHash } : {}),
+                whatsappNotificationStatus: initialNotificationStatus
+            });
             await newOrder.save();
+            try {
+                if (initialNotificationStatus === "pending") {
+                    await processOrderWhatsAppNotification(orderId, { env: whatsappEnv, fetchImpl: whatsappFetch });
+                }
+            } catch {
+                console.error("WhatsApp notification processing failed; order remains saved for reconciliation");
+            }
             res.status(201).json({ orderId });
         } catch (error) {
-            console.error("Order creation failed:", error.message);
+            if (error.code === 11000 && idempotencyKey) {
+                try {
+                    const existing = await Order.findOne({ idempotencyKey }).select("+idempotencyKey +requestHash");
+                    if (existing) {
+                        if (existing.requestHash !== requestHash) return res.status(409).json({ error: "This checkout key was already used for a different order" });
+                        return res.status(200).json({ orderId: existing.orderId });
+                    }
+                } catch {
+                    // Fall through to a generic safe error if the idempotency lookup fails.
+                }
+            }
+            console.error("Order creation failed");
             res.status(500).json({ error: "Failed to save order" });
         }
     });
@@ -570,6 +721,14 @@ function createApp({
         }
         const product = await Product.findById(req.params.id);
         if (!product) return res.status(404).json({ error: "Product not found" });
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, "customizationEnabled")) {
+            if (typeof req.body.customizationEnabled !== "boolean") {
+                return res.status(400).json({ error: "customizationEnabled must be a boolean" });
+            }
+            product.customizationEnabled = req.body.customizationEnabled;
+            await product.save();
+            return res.json({ message: "Customization setting updated", customizationEnabled: product.customizationEnabled });
+        }
         product.inStock = !product.inStock;
         await product.save();
         res.json({ message: "Stock updated", inStock: product.inStock });
@@ -589,6 +748,37 @@ function createApp({
     app.get("/api/orders", requireAdmin, async (req, res) => {
         const orders = await Order.find().sort({ createdAt: -1 });
         res.json(orders);
+    });
+
+    app.post("/api/admin/orders/:id/whatsapp-notification/retry", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const outcome = await processOrderWhatsAppNotification(req.params.id, { retry: true, env: whatsappEnv, fetchImpl: whatsappFetch });
+        if (outcome.status === "not_found") return res.status(404).json({ error: "Order not found" });
+        if (outcome.status === "not_configured") return res.status(503).json({ error: "WhatsApp notification is not configured" });
+        if (outcome.status === "unknown" || outcome.status === "sending") return res.status(409).json({ error: "Notification outcome is uncertain. Check Meta delivery records before retrying." });
+        return res.json({ status: outcome.status });
+    });
+
+    app.post("/api/admin/orders/:id/whatsapp-notification/confirm-sent", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        if (req.body?.confirmed !== true) return res.status(400).json({ error: "Explicit confirmation is required" });
+        const result = await Order.updateOne(
+            { orderId: req.params.id, whatsappNotificationStatus: { $in: ["unknown", "sending"] }, whatsappNotificationAttemptedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } },
+            { $set: { whatsappNotificationStatus: "sent" } }
+        );
+        if (result.modifiedCount !== 1) return res.status(409).json({ error: "Only an uncertain notification older than five minutes can be reconciled" });
+        return res.json({ status: "sent" });
+    });
+
+    app.post("/api/admin/orders/:id/whatsapp-notification/confirm-not-sent-retry", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        if (req.body?.confirmedNotSent !== true) return res.status(400).json({ error: "Explicit confirmation is required" });
+        const result = await Order.updateOne(
+            { orderId: req.params.id, whatsappNotificationStatus: { $in: ["unknown", "sending"] }, whatsappNotificationAttemptedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } },
+            { $set: { whatsappNotificationStatus: "failed" } }
+        );
+        if (result.modifiedCount !== 1) return res.status(409).json({ error: "Only an uncertain notification older than five minutes can be reconciled" });
+        const outcome = await processOrderWhatsAppNotification(req.params.id, { retry: true, env: whatsappEnv, fetchImpl: whatsappFetch });
+        if (outcome.status === "not_configured") return res.status(503).json({ error: "WhatsApp notification is not configured" });
+        if (["unknown", "sending"].includes(outcome.status)) return res.status(409).json({ error: "Retry outcome is uncertain. Check Meta delivery records before taking further action." });
+        return res.json({ status: outcome.status });
     });
 
     app.put("/api/orders/:id", requireTrustedOrigin, requireAdmin, async (req, res) => {
@@ -651,6 +841,7 @@ async function startServer() {
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB Connected");
     await seedLegacyCategories();
+    await Order.createIndexes();
     const store = MongoStore.create({
         client: mongoose.connection.getClient(),
         dbName: mongoose.connection.name,
@@ -677,4 +868,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification };
