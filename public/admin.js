@@ -3,9 +3,7 @@ function goBack() { window.history.back(); }
 const productsContainer = document.getElementById("products");
 productsContainer.innerHTML = "<p role=\"status\">Loading products…</p>";
 const categorySelect = document.getElementById("category");
-const categoryForm = document.getElementById("createCategoryForm");
 const categoryFeedback = document.getElementById("categoryFeedback");
-const createCategoryButton = document.getElementById("createCategoryButton");
 
 async function loadCategories(selectedId = "") {
   const response = await fetch("/api/categories");
@@ -19,8 +17,8 @@ async function loadCategories(selectedId = "") {
     options.push(new Option(category.name, String(category.id)));
   });
   if (categories.length === 0) {
-    options[0] = new Option("No categories yet — create one below", "");
-    categoryFeedback.textContent = "No categories exist yet. Create a category below before adding a product.";
+    options[0] = new Option("No categories yet — manage categories", "");
+    categoryFeedback.textContent = "No categories exist yet. Create one on the Category Management page.";
     categoryFeedback.setAttribute("role", "status");
   }
   categorySelect.replaceChildren(...options);
@@ -77,38 +75,6 @@ async function addProduct() {
   }
 }
 
-async function createCategory(event) {
-  event.preventDefault();
-  const nameInput = document.getElementById("categoryName");
-  const name = nameInput.value.trim();
-  categoryFeedback.textContent = "";
-  if (!name || name.length > 80) {
-    categoryFeedback.textContent = "Enter a category name of 1 to 80 characters.";
-    categoryFeedback.setAttribute("role", "alert");
-    return;
-  }
-
-  createCategoryButton.disabled = true;
-  try {
-    const response = await fetch("/api/categories", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name })
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(result.error || "Category could not be created.");
-    await loadCategories(result.category?.id || "");
-    categoryForm.reset();
-    categoryFeedback.textContent = `${result.category.name} was created and selected.`;
-    categoryFeedback.setAttribute("role", "status");
-  } catch (error) {
-    console.error("Category creation failed:", error);
-    categoryFeedback.textContent = error.message || "Category could not be created. Please try again.";
-    categoryFeedback.setAttribute("role", "alert");
-  } finally {
-    createCategoryButton.disabled = false;
-  }
-}
 async function deleteProduct(id) {
   try {
     const response = await fetch(`/api/products/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -125,7 +91,6 @@ async function toggleStock(id) {
     await loadProducts();
   } catch (error) { alert(error.message); }
 }
-categoryForm.addEventListener("submit", createCategory);
 requireAdminPage().then(isAdmin => {
   if (!isAdmin) return;
   loadCategories().catch(error => {

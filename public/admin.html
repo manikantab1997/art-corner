@@ -41,6 +41,7 @@
             <select id="category" required>
                 <option value="">Loading categories…</option>
             </select>
+            <p id="categoryFeedback" role="status" aria-live="polite"></p>
 
             <label for="image">Product image</label>
             <input type="file" id="image" accept="image/*" required>
@@ -49,16 +50,6 @@
                 Add Product
             </button>
 
-        </div>
-
-        <div class="admin-form">
-            <h2>Create Category</h2>
-            <form id="createCategoryForm">
-                <label for="categoryName">Category name</label>
-                <input id="categoryName" name="name" placeholder="e.g. Pottery" maxlength="80" required>
-                <button type="submit" id="createCategoryButton">Create Category</button>
-                <p id="categoryFeedback" role="status" aria-live="polite"></p>
-            </form>
         </div>
 
         <hr>

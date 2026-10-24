@@ -243,3 +243,82 @@ test("real MongoDB: concurrent creation uses unique indexes and leaves a monoton
   assert.ok(afterReseed >= beforeReseed);
   assert.ok(afterReseed > Math.max(...(await Category.find().distinct("id"))));
 });
+
+test("real MongoDB: rename preserves category ID and deletion protects legacy and assigned categories", async () => {
+  await resetDisposableCollections();
+  await Product.create([
+    { name: "Candle", categoryId: 1, inStock: true },
+    { name: "Resin", categoryId: 2, inStock: false },
+    { name: "Bracelet", categoryId: 3, inStock: true }
+  ]);
+  await seedLegacyCategories();
+
+  await withAdminApi(async (request, cookie) => {
+    const create = await request("/api/categories", { method: "POST", cookie, body: { name: "Pottery" } });
+    assert.equal(create.response.status, 201, create.text);
+    const categoryId = JSON.parse(create.text).category.id;
+    await Product.create({ name: "Archived pottery", categoryId, inStock: false });
+
+    const rename = await request(`/api/categories/${categoryId}`, { method: "PUT", cookie, body: { name: "Clay Art" } });
+    assert.equal(rename.response.status, 200, rename.text);
+    assert.equal(JSON.parse(rename.text).category.id, categoryId);
+    assert.equal((await Category.findOne({ id: categoryId })).normalizedName, "clay art");
+    assert.equal((await Product.findOne({ name: "Archived pottery" })).categoryId, categoryId);
+    const duplicate = await request(`/api/categories/${categoryId}`, { method: "PUT", cookie, body: { name: " candles " } });
+    assert.equal(duplicate.response.status, 409);
+
+    const legacyDelete = await request("/api/categories/1", { method: "DELETE", cookie });
+    assert.equal(legacyDelete.response.status, 409);
+
+    const assignedDelete = await request(`/api/categories/${categoryId}`, { method: "DELETE", cookie });
+    assert.equal(assignedDelete.response.status, 409);
+    assert.match(JSON.parse(assignedDelete.text).error, /out-of-stock products/i);
+    assert.ok(await Category.findOne({ id: categoryId }));
+
+    await Product.deleteMany({ categoryId });
+    const emptyDelete = await request(`/api/categories/${categoryId}`, { method: "DELETE", cookie });
+    assert.equal(emptyDelete.response.status, 200, emptyDelete.text);
+    assert.equal(await Category.findOne({ id: categoryId }), null);
+    assert.equal((await CategoryCounter.findById("category")).sequence, categoryId);
+
+    const next = await request("/api/categories", { method: "POST", cookie, body: { name: "Pottery" } });
+    assert.equal(next.response.status, 201, next.text);
+    assert.equal(JSON.parse(next.text).category.id, categoryId + 1, "deleted category IDs must not be recycled");
+  });
+});
+
+test("real MongoDB: category deletion refuses an active product-assignment reservation", async () => {
+  await resetDisposableCollections();
+  await Product.create([
+    { name: "Candle", categoryId: 1, inStock: true },
+    { name: "Resin", categoryId: 2, inStock: true },
+    { name: "Bracelet", categoryId: 3, inStock: false }
+  ]);
+  await seedLegacyCategories();
+
+  await withAdminApi(async (request, cookie) => {
+    const create = await request("/api/categories", { method: "POST", cookie, body: { name: "Macrame" } });
+    assert.equal(create.response.status, 201, create.text);
+    const categoryId = JSON.parse(create.text).category.id;
+    const [reservation, deletion] = await Promise.all([
+      Category.findOneAndUpdate(
+        { id: categoryId, deleting: { $ne: true } },
+        { $inc: { pendingProductAssignments: 1 } },
+        { new: true }
+      ),
+      request(`/api/categories/${categoryId}`, { method: "DELETE", cookie })
+    ]);
+    if (reservation) {
+      assert.equal(deletion.response.status, 409, deletion.text);
+      assert.ok(await Category.findOne({ id: categoryId }));
+      await Category.updateOne({ id: categoryId, pendingProductAssignments: { $gt: 0 } }, {
+        $inc: { pendingProductAssignments: -1 }
+      });
+      const retry = await request(`/api/categories/${categoryId}`, { method: "DELETE", cookie });
+      assert.equal(retry.response.status, 200, retry.text);
+    } else {
+      assert.equal(deletion.response.status, 200, deletion.text);
+      assert.equal(await Category.findOne({ id: categoryId }), null);
+    }
+  });
+});

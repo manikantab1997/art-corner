@@ -29,7 +29,9 @@ const categorySchema = new mongoose.Schema({
     id: { type: Number, required: true, min: 1 },
     name: { type: String, required: true, trim: true, maxlength: 80 },
     normalizedName: { type: String, required: true },
-    image: { type: String, default: null }
+    image: { type: String, default: null },
+    pendingProductAssignments: { type: Number, default: 0, min: 0 },
+    deleting: { type: Boolean, default: false }
 }, { versionKey: false });
 categorySchema.index({ id: 1 }, { unique: true });
 categorySchema.index({ normalizedName: 1 }, { unique: true });
@@ -322,6 +324,92 @@ function createApp({
         }
     });
 
+    app.put("/api/categories/:id", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const id = Number(req.params.id);
+        if (!Number.isSafeInteger(id) || id <= 0) {
+            return res.status(400).json({ error: "Category ID must be a positive integer" });
+        }
+        const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+        if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) {
+            return res.status(400).json({ error: "Category name is required and must be 80 characters or fewer" });
+        }
+
+        const normalizedName = normalizeCategoryName(name);
+        const currentCategory = await Category.findOne({ id }).lean();
+        if (!currentCategory) return res.status(404).json({ error: "Category not found" });
+        if (currentCategory.deleting) return res.status(409).json({ error: "Category is being deleted. Refresh and try again." });
+
+        const duplicate = await Category.findOne({ normalizedName }).lean();
+        if (duplicate && duplicate.id !== id) {
+            return res.status(409).json({ error: "A category with that name already exists" });
+        }
+
+        try {
+            const category = await Category.findOneAndUpdate(
+                { id, deleting: { $ne: true } },
+                { $set: { name, normalizedName } },
+                { new: true, runValidators: true }
+            );
+            if (!category) return res.status(409).json({ error: "Category is being modified. Refresh and try again." });
+            return res.json({ message: "Category renamed", category: publicCategory(category) });
+        } catch (error) {
+            if (error.code === 11000) {
+                return res.status(409).json({ error: "A category with that name already exists" });
+            }
+            throw error;
+        }
+    });
+
+    app.delete("/api/categories/:id", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const id = Number(req.params.id);
+        if (!Number.isSafeInteger(id) || id <= 0) {
+            return res.status(400).json({ error: "Category ID must be a positive integer" });
+        }
+        const initialCategory = await Category.findOne({ id }).lean();
+        if (!initialCategory) return res.status(404).json({ error: "Category not found" });
+        if (id <= 3) {
+            return res.status(409).json({ error: "The original Candles, Resin Art, and Bracelets categories cannot be deleted" });
+        }
+
+        // Mark the category unavailable before checking products. Product creation
+        // atomically reserves an assignment against this same document, closing the
+        // race between the product check and category deletion across server instances.
+        let category = await Category.findOneAndUpdate(
+            { id, deleting: { $ne: true } },
+            { $set: { deleting: true } },
+            { new: true }
+        );
+        if (!category) {
+            category = await Category.findOne({ id }).lean();
+            if (!category) return res.status(404).json({ error: "Category not found" });
+            if (!category.deleting) return res.status(409).json({ error: "Category is being modified. Refresh and try again." });
+        }
+
+        const releaseDeletionLock = async () => {
+            await Category.updateOne({ id, deleting: true }, { $set: { deleting: false } });
+        };
+
+        try {
+            if ((category.pendingProductAssignments || 0) > 0) {
+                await releaseDeletionLock();
+                return res.status(409).json({ error: "A product is being assigned to this category. Try again shortly." });
+            }
+            if (await Product.exists({ categoryId: id })) {
+                await releaseDeletionLock();
+                return res.status(409).json({ error: "This category still has products assigned, including out-of-stock products" });
+            }
+            const result = await Category.deleteOne({ id, deleting: true, pendingProductAssignments: { $in: [null, 0] } });
+            if (result.deletedCount !== 1) {
+                await releaseDeletionLock();
+                return res.status(409).json({ error: "Category is being modified. Refresh and try again." });
+            }
+            return res.json({ message: "Category deleted", id });
+        } catch (error) {
+            await releaseDeletionLock().catch(() => {});
+            throw error;
+        }
+    });
+
     app.get("/api/products/:categoryId", async (req, res) => {
         const categoryId = Number(req.params.categoryId);
         if (!Number.isInteger(categoryId) || categoryId <= 0) {
@@ -348,13 +436,35 @@ function createApp({
         if (!req.file) {
             return res.status(400).json({ error: "A product image is required" });
         }
-        if (!await Category.exists({ id: categoryId })) {
-            return res.status(400).json({ error: "Selected category does not exist" });
+        const categoryReservation = await Category.findOneAndUpdate(
+            { id: categoryId, deleting: { $ne: true } },
+            { $inc: { pendingProductAssignments: 1 } },
+            { new: true }
+        );
+        if (!categoryReservation) {
+            return res.status(400).json({ error: "Selected category does not exist or is being deleted" });
         }
 
-        const product = await new Product({
-            name, price, categoryId, image: `/uploads/${req.file.filename}`
-        }).save();
+        const releaseReservation = () => Category.updateOne(
+            { id: categoryId, pendingProductAssignments: { $gt: 0 } },
+            { $inc: { pendingProductAssignments: -1 } }
+        );
+        let product;
+        try {
+            product = await new Product({
+                name, price, categoryId, image: `/uploads/${req.file.filename}`
+            }).save();
+        } catch (error) {
+            await releaseReservation();
+            throw error;
+        }
+        try {
+            await releaseReservation();
+        } catch {
+            // Keep the assignment reservation fail-closed; deletion will refuse
+            // while it remains, and the successful product response stays accurate.
+            console.error("Product category reservation cleanup failed");
+        }
         res.status(201).json({ message: "Product added", product });
     });
 

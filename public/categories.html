@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Category Management | Art Corner</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+    <div id="navbar-container"></div>
+
+    <main class="page-container category-management">
+        <div class="category-management-heading">
+            <div>
+                <h1>Category Management</h1>
+                <p>Categories organize products across the storefront.</p>
+            </div>
+            <a class="category-back-link" href="dashboard.html">← Admin Dashboard</a>
+        </div>
+
+        <form id="createCategoryForm" class="admin-form">
+            <h2>Create Category</h2>
+            <label for="categoryName">Category name</label>
+            <input id="categoryName" name="name" placeholder="e.g. Pottery" maxlength="80" required>
+            <button type="submit" id="createCategoryButton">Create Category</button>
+        </form>
+
+        <p id="categoryFeedback" class="category-management-feedback" role="status" aria-live="polite"></p>
+        <section id="categoriesList" class="category-management-list" aria-label="Categories">
+            <p role="status">Loading categories…</p>
+        </section>
+    </main>
+
+    <div id="footer-container"></div>
+
+    <div class="bottom-nav">
+        <a href="index.html">🏠</a>
+        <a href="products.html">🛍️</a>
+        <a href="cart.html">🛒</a>
+        <a href="dashboard.html" class="active">⚙️</a>
+    </div>
+
+    <script src="js/common.js"></script>
+    <script src="categories.js"></script>
+</body>
+
+</html>

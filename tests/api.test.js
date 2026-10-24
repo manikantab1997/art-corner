@@ -132,15 +132,47 @@ async function withCategoryMocks(callback, initialCategories = legacyCategoryFix
     return query;
   });
   stub(Category, "exists", async filter => records.some(category => category.id === filter.id));
+  stub(Category, "findOneAndUpdate", async (filter, update) => {
+    const category = records.find(record => record.id === filter.id &&
+      (filter.deleting?.$ne !== true || record.deleting !== true));
+    if (!category) return null;
+    if (update.$set?.normalizedName && records.some(record => record !== category && record.normalizedName === update.$set.normalizedName)) {
+      const error = new Error("duplicate key");
+      error.code = 11000;
+      throw error;
+    }
+    Object.assign(category, update.$set || {});
+    for (const [key, value] of Object.entries(update.$inc || {})) category[key] = (category[key] || 0) + value;
+    category.pendingProductAssignments ??= 0;
+    category.deleting ??= false;
+    return { ...category };
+  });
+  stub(Category, "updateOne", async (filter, update) => {
+    const category = records.find(record => record.id === filter.id &&
+      (filter.deleting === undefined || record.deleting === filter.deleting) &&
+      (filter.pendingProductAssignments?.$gt === undefined || (record.pendingProductAssignments || 0) > filter.pendingProductAssignments.$gt));
+    if (!category && update.$setOnInsert) {
+      records.push({ ...update.$setOnInsert, pendingProductAssignments: 0, deleting: false });
+      return { acknowledged: true };
+    }
+    if (!category) return { matchedCount: 0 };
+    Object.assign(category, update.$set || {});
+    for (const [key, value] of Object.entries(update.$inc || {})) category[key] = (category[key] || 0) + value;
+    return { matchedCount: 1 };
+  });
+  stub(Category, "deleteOne", async filter => {
+    const index = records.findIndex(record => record.id === filter.id && record.deleting === true &&
+      [null, 0].includes(record.pendingProductAssignments ?? null));
+    if (index < 0) return { deletedCount: 0 };
+    records.splice(index, 1);
+    return { deletedCount: 1 };
+  });
   stub(Product, "distinct", async field => {
     assert.equal(field, "categoryId");
     return productCategoryIds;
   });
+  stub(Product, "exists", async filter => productCategoryIds.includes(filter.categoryId));
   stub(Category, "init", async () => {});
-  stub(Category, "updateOne", async (filter, update) => {
-    if (!records.some(category => category.id === filter.id)) records.push({ ...update.$setOnInsert });
-    return { acknowledged: true };
-  });
   stub(CategoryCounter, "findOneAndUpdate", async (filter, update) => {
     if (update.$max) sequence = Math.max(sequence, update.$max.sequence);
     if (update.$inc) sequence += update.$inc.sequence;
@@ -217,14 +249,17 @@ function uiElement(tagName = "div") {
     set innerHTML(value) { this._innerHTML = value; this.children = []; },
     get innerHTML() { return this._innerHTML || ""; },
     appendChild(child) { this.children.push(child); return child; },
+    append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
     addEventListener(type, handler) { this.handlers[type] = handler; },
     setAttribute(name, value) { this.attributes[name] = value; },
     reset() { this.resetCalled = true; },
-    querySelector() { return uiElement("button"); }
+    focus() { this.focused = true; },
+    remove() { this.removed = true; },
+    querySelector(selector) { return this.children.find(child => child.className === selector.slice(1)) || null; }
   };
 }
-async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = "", requireAdminPage } = {}) {
+async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true } = {}) {
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" } };
   const document = {
     getElementById: id => nodes[id] || null,
@@ -232,7 +267,7 @@ async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = 
   };
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
-    document, window, fetch: fetchImpl, console, URLSearchParams,
+    document, window: { ...window, confirm: confirmImpl }, fetch: fetchImpl, console, URLSearchParams,
     encodeURIComponent, requireAdminPage, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
     FormData: class { append() {} }, alert() {}
   });
@@ -507,16 +542,39 @@ test("concurrent creation of the same normalized category name yields one catego
   }));
 });
 test("product creation rejects a category ID that is not present", async () => {
-  stub(Category, "exists", async filter => {
-    assert.deepEqual(filter, { id: 99 });
-    return false;
+  stub(Category, "findOneAndUpdate", async filter => {
+    assert.deepEqual(filter, { id: 99, deleting: { $ne: true } });
+    return null;
   });
   try {
     const result = await invoke(routeStack("post", "/api/products").at(-1), {
       body: { name: "Sample", price: "10", categoryId: "99" }, file: { filename: "test.jpg" }
     });
     assert.equal(result.statusCode, 400);
-    assert.equal(result.body.error, "Selected category does not exist");
+    assert.equal(result.body.error, "Selected category does not exist or is being deleted");
+  } finally {
+    restore();
+  }
+});
+test("product creation reserves and releases a category assignment atomically", async () => {
+  let released = false;
+  stub(Category, "findOneAndUpdate", async filter => {
+    assert.deepEqual(filter, { id: 1, deleting: { $ne: true } });
+    return { id: 1 };
+  });
+  stub(Category, "updateOne", async (filter, update) => {
+    assert.deepEqual(filter, { id: 1, pendingProductAssignments: { $gt: 0 } });
+    assert.deepEqual(update, { $inc: { pendingProductAssignments: -1 } });
+    released = true;
+    return { matchedCount: 1 };
+  });
+  stub(Product.prototype, "save", async function () { return this; });
+  try {
+    const result = await invoke(routeStack("post", "/api/products").at(-1), {
+      body: { name: "Sample", price: "10", categoryId: "1" }, file: { filename: "test.jpg" }
+    });
+    assert.equal(result.statusCode, 201);
+    assert.equal(released, true);
   } finally {
     restore();
   }
@@ -603,69 +661,173 @@ test("product page uses fetched category names and still renders products if cat
   assert.equal(failedNodes.categoryFilter.value, "");
   assert.equal(failedBrowser.window.history.replacedUrl, "products.html");
 });
-test("admin category form refreshes and selects a new category, and shows API errors", async () => {
-  async function setup(fetchImpl) {
-    const nodes = {
-      products: uiElement(), category: uiElement("select"), createCategoryForm: uiElement("form"),
-      categoryFeedback: uiElement("p"), createCategoryButton: uiElement("button"),
-      categoryName: uiElement("input")
-    };
-    const result = await runBrowserScript("public/admin.js", {
-      nodes, fetchImpl, requireAdminPage: async () => true
-    });
-    assert.equal(typeof nodes.createCategoryForm.handlers.submit, "function");
-    return result;
-  }
-  let categoryFetches = 0;
-  const browser = await setup(async (url, options = {}) => {
-    if (url === "/api/categories" && options.method === "POST") {
-      return { ok: true, json: async () => ({ category: { id: 4, name: "Pottery" } }) };
-    }
-    if (url === "/api/categories") {
-      categoryFetches++;
-      return { ok: true, json: async () => categoryFetches === 1
-        ? legacyCategoryFixtures.map(({ id, name, image }) => ({ id, name, image }))
-        : [...legacyCategoryFixtures.map(({ id, name, image }) => ({ id, name, image })), { id: 4, name: "Pottery" }] };
-    }
-    return { ok: true, json: async () => [] };
-  });
-  browser.nodes.categoryName.value = "Pottery";
-  await browser.nodes.createCategoryForm.handlers.submit({ preventDefault() {} });
-  assert.equal(browser.nodes.category.value, "4");
-  assert.equal(browser.nodes.category.children.at(-1).textContent, "Pottery");
-  assert.match(browser.nodes.categoryFeedback.textContent, /created and selected/i);
-
-  const errorBrowser = await setup(async (url, options = {}) => {
-    if (url === "/api/categories" && options.method === "POST") {
-      return { ok: false, json: async () => ({ error: "A category with that name already exists" }) };
-    }
-    if (url === "/api/categories") return { ok: true, json: async () => legacyCategoryFixtures };
-    return { ok: true, json: async () => [] };
-  });
-  errorBrowser.nodes.categoryName.value = "Candles";
-  await errorBrowser.nodes.createCategoryForm.handlers.submit({ preventDefault() {} });
-  assert.match(errorBrowser.nodes.categoryFeedback.textContent, /already exists/i);
-  assert.equal(errorBrowser.nodes.categoryFeedback.attributes.role, "alert");
-});
-test("admin category dropdown reports a successful empty category response", async () => {
+test("category management page lists and creates categories", async () => {
   const nodes = {
-    products: uiElement(), category: uiElement("select"), createCategoryForm: uiElement("form"),
-    categoryFeedback: uiElement("p"), createCategoryButton: uiElement("button"), categoryName: uiElement("input")
+    categoriesList: uiElement(), categoryFeedback: uiElement("p"), createCategoryForm: uiElement("form"),
+    createCategoryButton: uiElement("button"), categoryName: uiElement("input")
   };
+  let categories = legacyCategoryFixtures.map(category => ({ ...category }));
+  await runBrowserScript("public/categories.js", {
+    nodes,
+    fetchImpl: async (url, options = {}) => {
+      if (url === "/api/categories" && options.method === "POST") {
+        if (JSON.parse(options.body).name === "Candles") {
+          return { ok: false, json: async () => ({ error: "A category with that name already exists" }) };
+        }
+        categories.push({ id: 4, name: JSON.parse(options.body).name });
+        return { ok: true, json: async () => ({ category: categories.at(-1) }) };
+      }
+      return { ok: true, json: async () => categories };
+    },
+    requireAdminPage: async () => true
+  });
+  assert.equal(nodes.categoriesList.children.length, 3);
+  assert.match(nodes.categoriesList.children[0].children[1].textContent, /ID: 1/);
+  nodes.categoryName.value = "Pottery";
+  await nodes.createCategoryForm.handlers.submit({ preventDefault() {} });
+  assert.equal(nodes.categoriesList.children.length, 4);
+  assert.match(nodes.categoryFeedback.textContent, /Pottery was created/);
+  nodes.categoryName.value = "Candles";
+  await nodes.createCategoryForm.handlers.submit({ preventDefault() {} });
+  assert.match(nodes.categoryFeedback.textContent, /already exists/i);
+  assert.equal(nodes.categoryFeedback.attributes.role, "alert");
+});
+test("category management page displays an empty-category state", async () => {
+  const nodes = {
+    categoriesList: uiElement(), categoryFeedback: uiElement("p"), createCategoryForm: uiElement("form"),
+    createCategoryButton: uiElement("button"), categoryName: uiElement("input")
+  };
+  await runBrowserScript("public/categories.js", {
+    nodes,
+    fetchImpl: async () => ({ ok: true, json: async () => [] }),
+    requireAdminPage: async () => true
+  });
+  assert.match(nodes.categoriesList.children[0].textContent, /No categories yet/i);
+  assert.equal(nodes.categoriesList.children[0].attributes.role, "status");
+});
+test("category management renames, confirms deletion, and reports API failures", async () => {
+  const nodes = {
+    categoriesList: uiElement(), categoryFeedback: uiElement("p"), createCategoryForm: uiElement("form"),
+    createCategoryButton: uiElement("button"), categoryName: uiElement("input")
+  };
+  let categories = [...legacyCategoryFixtures.map(category => ({ ...category })), { id: 4, name: "Pottery" }];
+  const requests = [];
+  await runBrowserScript("public/categories.js", {
+    nodes,
+    fetchImpl: async (url, options = {}) => {
+      requests.push({ url, options });
+      if (options.method === "PUT") {
+        categories[3].name = JSON.parse(options.body).name;
+        return { ok: true, json: async () => ({ category: categories[3] }) };
+      }
+      if (options.method === "DELETE") {
+        categories = categories.filter(category => category.id !== 4);
+        return { ok: true, json: async () => ({}) };
+      }
+      return { ok: true, json: async () => categories };
+    },
+    requireAdminPage: async () => true,
+    confirmImpl: () => true
+  });
+  const card = nodes.categoriesList.children[3];
+  await card.children[2].children[0].handlers.click();
+  const renameForm = card.children.at(-1);
+  renameForm.children[0].children[0].value = "Pottery Art";
+  await renameForm.handlers.submit({ preventDefault() {} });
+  assert.equal(requests.find(request => request.options.method === "PUT").url, "/api/categories/4");
+  assert.equal(nodes.categoriesList.children[3].children[0].textContent, "Pottery Art");
+  await nodes.categoriesList.children[3].children[2].children[1].handlers.click();
+  assert.ok(requests.some(request => request.options.method === "DELETE" && request.url === "/api/categories/4"));
+  assert.equal(nodes.categoriesList.children.length, 3);
+  assert.match(nodes.categoryFeedback.textContent, /Pottery Art was deleted/);
+
+  const failedNodes = {
+    categoriesList: uiElement(), categoryFeedback: uiElement("p"), createCategoryForm: uiElement("form"),
+    createCategoryButton: uiElement("button"), categoryName: uiElement("input")
+  };
+  await runBrowserScript("public/categories.js", {
+    nodes: failedNodes,
+    fetchImpl: async () => ({ ok: false, json: async () => ({ error: "Category service unavailable" }) }),
+    requireAdminPage: async () => true
+  });
+  assert.equal(failedNodes.categoriesList.children[0].attributes.role, "alert");
+  assert.match(failedNodes.categoryFeedback.textContent, /service unavailable/i);
+});
+test("product management has no category mutation controls and dashboard links to category page", () => {
+  const adminHtml = fs.readFileSync(path.join(__dirname, "../public/admin.html"), "utf8");
+  assert.match(adminHtml, /id="category"/);
+  assert.doesNotMatch(adminHtml, /createCategoryForm|categoryName|Create Category|Rename Category|Delete Category/);
+  const dashboardHtml = fs.readFileSync(path.join(__dirname, "../public/dashboard.html"), "utf8");
+  assert.match(dashboardHtml, /href="categories\.html"[\s\S]*Category Management/);
+});
+test("admin category dropdown reports the empty-state and links to category management", async () => {
+  const nodes = { products: uiElement(), category: uiElement("select"), categoryFeedback: uiElement("p") };
   await runBrowserScript("public/admin.js", {
     nodes,
     fetchImpl: async url => ({ ok: true, json: async () => url === "/api/categories" ? [] : [] }),
     requireAdminPage: async () => true
   });
-  assert.equal(nodes.category.children.length, 1);
-  assert.match(nodes.category.children[0].textContent, /no categories yet/i);
-  assert.match(nodes.categoryFeedback.textContent, /create a category below/i);
-  assert.equal(nodes.categoryFeedback.attributes.role, "status");
+  assert.match(nodes.category.children[0].textContent, /manage categories/i);
+  assert.match(nodes.categoryFeedback.textContent, /Category Management page/i);
+});
+test("category rename and delete require an authenticated trusted-origin request", async () => {
+  const extraCategory = { id: 4, name: "Pottery", normalizedName: "pottery", image: null };
+  await withCategoryMocks(async records => withHttpApp(async ({ request }) => {
+    records.push({ ...extraCategory });
+    const body = JSON.stringify({ name: "Clay Art" });
+    assert.equal((await request("/api/categories/4", { method: "PUT", body, headers: { "Content-Type": "application/json" } })).response.status, 401);
+    assert.equal((await request("/api/categories/4", { method: "DELETE" })).response.status, 401);
+
+    const login = await request("/api/admin/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+    });
+    const cookie = sessionCookie(login.setCookies);
+    assert.equal((await request("/api/categories/4", { method: "PUT", cookie, origin: "https://evil.example.test", body, headers: { "Content-Type": "application/json" } })).response.status, 403);
+    assert.equal((await request("/api/categories/4", { method: "DELETE", cookie, origin: "https://evil.example.test" })).response.status, 403);
+
+    const renamed = await request("/api/categories/4", { method: "PUT", cookie, body, headers: { "Content-Type": "application/json" } });
+    assert.equal(renamed.response.status, 200);
+    assert.equal(JSON.parse(renamed.text).category.id, 4);
+    assert.equal(JSON.parse(renamed.text).category.name, "Clay Art");
+    assert.equal((await request("/api/categories/4", { method: "PUT", cookie, body: JSON.stringify({ name: " candles " }), headers: { "Content-Type": "application/json" } })).response.status, 409);
+    assert.equal((await request("/api/categories/4", { method: "PUT", cookie, body: JSON.stringify({ name: "  " }), headers: { "Content-Type": "application/json" } })).response.status, 400);
+    assert.equal((await request("/api/categories/not-a-number", { method: "DELETE", cookie })).response.status, 400);
+  }));
+});
+test("an empty non-legacy category can be deleted without recycling its ID", async () => {
+  const extraCategory = { id: 4, name: "Pottery", normalizedName: "pottery", image: null };
+  await withCategoryMocks(async records => withHttpApp(async ({ request }) => {
+    records.push({ ...extraCategory });
+    const login = await request("/api/admin/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+    });
+    const response = await request("/api/categories/4", { method: "DELETE", cookie: sessionCookie(login.setCookies) });
+    assert.equal(response.response.status, 200);
+    assert.equal(records.some(category => category.id === 4), false);
+  }), legacyCategoryFixtures, [1, 2, 3]);
+});
+test("category deletion is blocked for legacy categories and categories assigned to products", async () => {
+  const extraCategory = { id: 4, name: "Pottery", normalizedName: "pottery", image: null };
+  await withCategoryMocks(async records => withHttpApp(async ({ request }) => {
+    records.push({ ...extraCategory });
+    const login = await request("/api/admin/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+    });
+    const cookie = sessionCookie(login.setCookies);
+    const legacy = await request("/api/categories/1", { method: "DELETE", cookie });
+    assert.equal(legacy.response.status, 409);
+    const assigned = await request("/api/categories/4", { method: "DELETE", cookie });
+    assert.equal(assigned.response.status, 409);
+    assert.match(JSON.parse(assigned.text).error, /out-of-stock products/i);
+    assert.ok(records.some(category => category.id === 4));
+  }), legacyCategoryFixtures, [1, 2, 3, 4]);
 });
 test("admin UI continues to load the protected product-list API", async () => {
   const nodes = {
-    products: uiElement(), category: uiElement("select"), createCategoryForm: uiElement("form"),
-    categoryFeedback: uiElement("p"), createCategoryButton: uiElement("button"), categoryName: uiElement("input")
+    products: uiElement(), category: uiElement("select"), categoryFeedback: uiElement("p")
   };
   const requested = [];
   await runBrowserScript("public/admin.js", {

@@ -560,6 +560,87 @@ button {
     width: 100%;
 }
 
+.category-management-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.category-management-heading p {
+    color: #666;
+}
+
+.category-back-link {
+    color: #7c5a3a;
+    font-weight: 600;
+}
+
+.category-management-feedback {
+    min-height: 1.5em;
+    text-align: center;
+}
+
+.category-management-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+    gap: 18px;
+}
+
+.category-management-item {
+    padding: 20px;
+    border: 1px solid #eadfd3;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, .04);
+}
+
+.category-management-item h2 {
+    margin: 0 0 8px;
+    color: #7c5a3a;
+}
+
+.category-management-id {
+    color: #666;
+}
+
+.category-management-actions,
+.category-rename-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.category-rename-form label {
+    flex-basis: 100%;
+}
+
+.category-rename-form input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.category-management-actions button,
+.category-rename-form button {
+    flex: 1 1 auto;
+}
+
+.category-management-item button:disabled {
+    cursor: not-allowed;
+    opacity: .55;
+}
+
+.category-delete-button {
+    background: #9b3d36;
+}
+
+.category-delete-button:hover {
+    background: #7e302b;
+}
+
 .stats {
     display: flex;
     justify-content: center;
