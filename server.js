@@ -25,6 +25,22 @@ const orderSchema = new mongoose.Schema({
 });
 const Order = mongoose.model("Order", orderSchema);
 
+const categorySchema = new mongoose.Schema({
+    id: { type: Number, required: true, min: 1 },
+    name: { type: String, required: true, trim: true, maxlength: 80 },
+    normalizedName: { type: String, required: true },
+    image: { type: String, default: null }
+}, { versionKey: false });
+categorySchema.index({ id: 1 }, { unique: true });
+categorySchema.index({ normalizedName: 1 }, { unique: true });
+const Category = mongoose.model("Category", categorySchema);
+
+const categoryCounterSchema = new mongoose.Schema({
+    _id: String,
+    sequence: { type: Number, required: true }
+}, { versionKey: false, collection: "category_counters" });
+const CategoryCounter = mongoose.model("CategoryCounter", categoryCounterSchema);
+
 const productSchema = new mongoose.Schema({
     name: String,
     categoryId: Number,
@@ -34,11 +50,81 @@ const productSchema = new mongoose.Schema({
 });
 const Product = mongoose.model("Product", productSchema);
 
-const categories = [
+const legacyCategories = [
     { id: 1, name: "Candles", image: "/uploads/candle.jpg" },
     { id: 2, name: "Resin Art", image: "/uploads/resin.jpg" },
     { id: 3, name: "Bracelets", image: "/uploads/bracelet.jpg" }
 ];
+
+function normalizeCategoryName(name) {
+    return name.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+async function seedLegacyCategories() {
+    const existing = await Category.find({}).lean();
+    const seenIds = new Map();
+    const seenNames = new Map();
+    for (const category of existing) {
+        if (!Number.isSafeInteger(category.id) || category.id <= 0 || typeof category.name !== "string" || !category.name.trim()) {
+            throw new Error("Existing Category records contain an invalid numeric ID or name; resolve them before startup");
+        }
+        const normalizedName = normalizeCategoryName(category.name);
+        if (!category.normalizedName || category.normalizedName !== normalizedName) {
+            throw new Error(`Existing category ID ${category.id} has a missing or inconsistent normalized name; resolve it before startup`);
+        }
+        if (seenIds.has(category.id)) throw new Error(`Conflicting existing Category records use numeric ID ${category.id}`);
+        if (seenNames.has(normalizedName)) throw new Error(`Conflicting existing Category records share the name "${category.name}"`);
+        seenIds.set(category.id, category);
+        seenNames.set(normalizedName, category);
+    }
+
+    for (const legacy of legacyCategories) {
+        const byId = seenIds.get(legacy.id);
+        const byName = seenNames.get(normalizeCategoryName(legacy.name));
+        if (byId && normalizeCategoryName(byId.name) !== normalizeCategoryName(legacy.name)) {
+            throw new Error(`Category ID ${legacy.id} is already assigned to "${byId.name}"; expected "${legacy.name}". No categories were seeded`);
+        }
+        if (byName && byName.id !== legacy.id) {
+            throw new Error(`Category "${legacy.name}" already uses ID ${byName.id}; expected ID ${legacy.id}. No categories were seeded`);
+        }
+    }
+
+    const knownCategoryIds = new Set([...seenIds.keys(), ...legacyCategories.map(category => category.id)]);
+    const productCategoryIds = await Product.distinct("categoryId");
+    for (const id of productCategoryIds) {
+        if (!Number.isSafeInteger(id) || id <= 0) {
+            throw new Error("Existing products contain an invalid categoryId; resolve it before category seeding");
+        }
+        if (!knownCategoryIds.has(id)) {
+            throw new Error(`Existing products use categoryId ${id}, but no category name is defined for it; resolve this conflict before startup`);
+        }
+    }
+
+    await Category.init();
+    for (const legacy of legacyCategories) {
+        try {
+            await Category.updateOne({ id: legacy.id }, {
+                $setOnInsert: { ...legacy, normalizedName: normalizeCategoryName(legacy.name) }
+            }, { upsert: true });
+        } catch (error) {
+            if (error.code === 11000) {
+                const concurrentCategory = await Category.findOne({ id: legacy.id }).lean();
+                if (concurrentCategory && normalizeCategoryName(concurrentCategory.name) === normalizeCategoryName(legacy.name)) continue;
+                throw new Error(`A concurrent category change conflicts with legacy category ID ${legacy.id}; no existing category was overwritten`);
+            }
+            throw error;
+        }
+    }
+
+    const maxCategory = await Category.findOne().sort({ id: -1 }).select({ id: 1 }).lean();
+    await CategoryCounter.findOneAndUpdate({ _id: "category" }, {
+        $max: { sequence: Math.max(3, maxCategory?.id || 0) }
+    }, { upsert: true, new: true });
+}
+
+function publicCategory(category) {
+    return { id: category.id, name: category.name, image: category.image || null };
+}
 
 function parsePasswordHash(encoded) {
     if (typeof encoded !== "string") return null;
@@ -131,6 +217,18 @@ function createApp({
         return next();
     };
 
+    // Same-origin browser GETs may omit Origin. Permit that read only when browser
+    // Fetch Metadata and Host both identify the configured storefront exactly.
+    const requireTrustedReadOrigin = (req, res, next) => {
+        const origin = req.get("Origin");
+        if (origin === trustedStorefrontOrigin) return next();
+        const trustedHost = new URL(trustedStorefrontOrigin).host;
+        if (origin === undefined && req.get("Sec-Fetch-Site") === "same-origin" && req.get("Host") === trustedHost) {
+            return next();
+        }
+        return res.status(403).json({ error: "Request origin is not allowed" });
+    };
+
     const loginLimiter = rateLimit({
         windowMs: 15 * 60 * 1000,
         limit: 5,
@@ -186,7 +284,43 @@ function createApp({
         });
     });
 
-    app.get("/api/categories", (req, res) => res.json(categories));
+    app.get("/api/categories", async (req, res) => {
+        const categories = await Category.find().sort({ id: 1 }).lean();
+        res.json(categories.map(publicCategory));
+    });
+
+    app.post("/api/categories", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+        if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) {
+            return res.status(400).json({ error: "Category name is required and must be 80 characters or fewer" });
+        }
+
+        const normalizedName = normalizeCategoryName(name);
+        if (await Category.findOne({ normalizedName })) {
+            return res.status(409).json({ error: "A category with that name already exists" });
+        }
+
+        const counter = await CategoryCounter.findOneAndUpdate({ _id: "category", sequence: { $lt: Number.MAX_SAFE_INTEGER } }, {
+            $inc: { sequence: 1 }
+        }, { new: true });
+        if (!counter || !Number.isSafeInteger(counter.sequence)) {
+            return res.status(503).json({ error: "No category IDs are currently available" });
+        }
+        try {
+            const category = await new Category({
+                id: counter.sequence,
+                name,
+                normalizedName,
+                image: null
+            }).save();
+            return res.status(201).json({ message: "Category created", category: publicCategory(category) });
+        } catch (error) {
+            if (error.code === 11000) {
+                return res.status(409).json({ error: "A category with that name or ID already exists. Refresh and try again." });
+            }
+            throw error;
+        }
+    });
 
     app.get("/api/products/:categoryId", async (req, res) => {
         const categoryId = Number(req.params.categoryId);
@@ -213,6 +347,9 @@ function createApp({
         }
         if (!req.file) {
             return res.status(400).json({ error: "A product image is required" });
+        }
+        if (!await Category.exists({ id: categoryId })) {
+            return res.status(400).json({ error: "Selected category does not exist" });
         }
 
         const product = await new Product({
@@ -267,6 +404,11 @@ function createApp({
     // Public product data remains limited to in-stock inventory.
     app.get("/api/products", async (req, res) => {
         const products = await Product.find({ inStock: true });
+        res.json(products);
+    });
+
+    app.get("/api/admin/products", requireTrustedReadOrigin, requireAdmin, async (req, res) => {
+        const products = await Product.find({});
         res.json(products);
     });
 
@@ -331,6 +473,7 @@ async function startServer() {
     validateProductionConfig();
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB Connected");
+    await seedLegacyCategories();
     const store = MongoStore.create({
         client: mongoose.connection.getClient(),
         dbName: mongoose.connection.name,
@@ -357,4 +500,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, Product, Order, createApp, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName };

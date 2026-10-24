@@ -2,20 +2,49 @@
 function goBack() { window.history.back(); }
 const productsContainer = document.getElementById("products");
 productsContainer.innerHTML = "<p role=\"status\">Loading products…</p>";
+const categorySelect = document.getElementById("category");
+const categoryForm = document.getElementById("createCategoryForm");
+const categoryFeedback = document.getElementById("categoryFeedback");
+const createCategoryButton = document.getElementById("createCategoryButton");
+
+async function loadCategories(selectedId = "") {
+  const response = await fetch("/api/categories");
+  if (!response.ok) throw new Error("Categories could not be loaded.");
+  const categories = await response.json();
+  if (!Array.isArray(categories)) throw new Error("The category response was invalid.");
+
+  const options = [new Option("Choose a category", "")];
+  categories.forEach(category => {
+    if (!Number.isInteger(Number(category.id)) || typeof category.name !== "string") return;
+    options.push(new Option(category.name, String(category.id)));
+  });
+  if (categories.length === 0) {
+    options[0] = new Option("No categories yet — create one below", "");
+    categoryFeedback.textContent = "No categories exist yet. Create a category below before adding a product.";
+    categoryFeedback.setAttribute("role", "status");
+  }
+  categorySelect.replaceChildren(...options);
+  if (selectedId && categories.some(category => String(category.id) === String(selectedId))) {
+    categorySelect.value = String(selectedId);
+  }
+  return categories;
+}
+
 async function loadProducts() {
   try {
-    const response = await fetch("/api/products");
+    const response = await fetch("/api/admin/products");
     if (!response.ok) throw new Error("Could not load products.");
     const products = await response.json();
+    if (!Array.isArray(products)) throw new Error("The product response was invalid.");
     productsContainer.innerHTML = "";
     if (!products.length) {
-      productsContainer.innerHTML = "<p>No in-stock products are available in this list.</p>";
+      productsContainer.innerHTML = "<p>No products are available in this list.</p>";
       return;
     }
     products.forEach(product => {
       const card = document.createElement("div");
       card.className = "card";
-      card.innerHTML = `<img src="${product.image}" alt="${product.name}" width="100"><h3>${product.name}</h3><p>₹${product.price}</p><p>In Stock</p><button onclick="deleteProduct('${product._id}')">Delete</button><button onclick="toggleStock('${product._id}')">Toggle Stock</button>`;
+      card.innerHTML = `<img src="${product.image}" alt="${product.name}" width="100"><h3>${product.name}</h3><p>₹${product.price}</p><p>${product.inStock ? "In Stock" : "Out of Stock"}</p><button onclick="deleteProduct('${product._id}')">Delete</button><button onclick="toggleStock('${product._id}')">Toggle Stock</button>`;
       productsContainer.appendChild(card);
     });
   } catch (error) {
@@ -29,7 +58,7 @@ async function addProduct() {
   const categoryId = document.getElementById("category").value.trim();
   const file = document.getElementById("image").files[0];
   if (!name || price === "" || !Number.isFinite(Number(price)) || Number(price) < 0 || !/^[1-9]\d*$/.test(categoryId) || !file) {
-    alert("Enter a product name, valid price and category ID, and choose an image.");
+    alert("Enter a product name, valid price, choose a category, and select an image.");
     return;
   }
   const formData = new FormData();
@@ -45,6 +74,39 @@ async function addProduct() {
     await loadProducts();
   } catch (error) {
     alert(error.message || "Product could not be added. Please try again.");
+  }
+}
+
+async function createCategory(event) {
+  event.preventDefault();
+  const nameInput = document.getElementById("categoryName");
+  const name = nameInput.value.trim();
+  categoryFeedback.textContent = "";
+  if (!name || name.length > 80) {
+    categoryFeedback.textContent = "Enter a category name of 1 to 80 characters.";
+    categoryFeedback.setAttribute("role", "alert");
+    return;
+  }
+
+  createCategoryButton.disabled = true;
+  try {
+    const response = await fetch("/api/categories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Category could not be created.");
+    await loadCategories(result.category?.id || "");
+    categoryForm.reset();
+    categoryFeedback.textContent = `${result.category.name} was created and selected.`;
+    categoryFeedback.setAttribute("role", "status");
+  } catch (error) {
+    console.error("Category creation failed:", error);
+    categoryFeedback.textContent = error.message || "Category could not be created. Please try again.";
+    categoryFeedback.setAttribute("role", "alert");
+  } finally {
+    createCategoryButton.disabled = false;
   }
 }
 async function deleteProduct(id) {
@@ -63,4 +125,14 @@ async function toggleStock(id) {
     await loadProducts();
   } catch (error) { alert(error.message); }
 }
-requireAdminPage().then(isAdmin => { if (isAdmin) loadProducts(); });
+categoryForm.addEventListener("submit", createCategory);
+requireAdminPage().then(isAdmin => {
+  if (!isAdmin) return;
+  loadCategories().catch(error => {
+    console.error("Category list request failed:", error);
+    categorySelect.replaceChildren(new Option("Categories unavailable", ""));
+    categoryFeedback.textContent = "Categories could not be loaded. Please refresh before adding a product.";
+    categoryFeedback.setAttribute("role", "alert");
+  });
+  loadProducts();
+});

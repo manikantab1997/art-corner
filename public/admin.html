@@ -31,18 +31,34 @@
 
             <h2>Add Product</h2>
 
-            <input id="name" placeholder="Product Name">
+            <label for="name">Product Name</label>
+            <input id="name" placeholder="Product Name" required maxlength="160">
 
-            <input id="price" placeholder="Price">
+            <label for="price">Price</label>
+            <input id="price" type="number" min="0" step="0.01" placeholder="Price" required>
 
-            <input id="category" placeholder="Category ID (1,2,3)">
+            <label for="category">Category</label>
+            <select id="category" required>
+                <option value="">Loading categories…</option>
+            </select>
 
-            <input type="file" id="image">
+            <label for="image">Product image</label>
+            <input type="file" id="image" accept="image/*" required>
 
             <button onclick="addProduct()">
                 Add Product
             </button>
 
+        </div>
+
+        <div class="admin-form">
+            <h2>Create Category</h2>
+            <form id="createCategoryForm">
+                <label for="categoryName">Category name</label>
+                <input id="categoryName" name="name" placeholder="e.g. Pottery" maxlength="80" required>
+                <button type="submit" id="createCategoryButton">Create Category</button>
+                <p id="categoryFeedback" role="status" aria-live="polite"></p>
+            </form>
         </div>
 
         <hr>

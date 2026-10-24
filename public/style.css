@@ -312,6 +312,57 @@ td {
     border-radius: 12px;
 }
 
+.category-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    padding: 20px 12px;
+}
+
+.category-tab {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 9px 18px;
+    border: 1px solid #d8c8b7;
+    border-radius: 999px;
+    background: #fff;
+    color: #493b31;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.category-tab:hover,
+.category-tab:focus-visible,
+.category-tab.active {
+    border-color: #6c4f3d;
+    background: #6c4f3d;
+    color: #fff;
+}
+
+.category-error {
+    flex-basis: 100%;
+    text-align: center;
+}
+
+@media (max-width: 600px) {
+    .category-tabs {
+        flex-wrap: nowrap;
+        justify-content: flex-start;
+        overflow-x: auto;
+        padding-right: 16px;
+        padding-left: 16px;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .category-tab {
+        flex: 0 0 auto;
+    }
+}
+
 #cart {
     display: flex;
     flex-direction: column;

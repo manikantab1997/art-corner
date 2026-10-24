@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "test": "node --test",
+    "test:mongodb": "node --test integration/mongodb-categories.integration.cjs",
     "start": "node server.js"
   },
   "keywords": [],
