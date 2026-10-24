@@ -34,7 +34,7 @@ async function loadNavbar() {
     const navbarContainer = document.getElementById("navbar-container");
     if (!navbarContainer) return;
     try {
-        const response = await fetch("/components/navbar.html");
+        const response = await fetch("components/navbar.html");
         if (!response.ok) throw new Error("Navigation could not be loaded.");
         navbarContainer.innerHTML = await response.text();
         const isAdmin = await getAdminSession();

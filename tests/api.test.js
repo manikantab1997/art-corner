@@ -267,6 +267,7 @@ function uiElement(tagName = "div") {
     handlers: {},
     attributes: {},
     className: "",
+    style: {},
     value: "",
     textContent: "",
     hidden: false,
@@ -293,7 +294,7 @@ async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = 
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
     document, window: { ...window, confirm: confirmImpl }, fetch: fetchImpl, console, URLSearchParams,
-    encodeURIComponent, requireAdminPage, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
+    URL, encodeURIComponent, requireAdminPage, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
     FormData: class { append() {} }, alert() {}
   });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -772,22 +773,129 @@ test("admin product listing requires session and trusted origin, then includes o
     }
   });
 });
-test("homepage category UI renders text tabs without category images and keeps All Products on API failure", async () => {
-  const categories = [{ id: 1, name: "Candles", image: "/uploads/candle.jpg" }, { id: 4, name: "Pottery", image: null }];
-  const tabs = uiElement("nav");
+test("homepage renders API-driven collection cards and real in-stock featured products", async () => {
+  const html = fs.readFileSync(path.join(__dirname, "../public/index.html"), "utf8");
+  assert.match(html, /class="home-hero"/);
+  assert.match(html, /Shop All Products/);
+  assert.match(html, /id="featured-products"/);
+
+  const categories = [{ id: 1, name: "Candles" }, { id: 4, name: "Pottery" }];
+  const products = [
+    { _id: "p1", name: "Tree Candle", categoryId: 1, price: 600, image: "/uploads/candle.jpg", inStock: true },
+    { _id: "p2", name: "Out of stock", categoryId: 4, price: 1, image: "/uploads/out.jpg", inStock: false }
+  ];
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "featured-products": uiElement("div"),
+    "home-products-status": uiElement("p"),
+    "hero-product-image": uiElement("img"),
+    "hero-image-caption": uiElement("span")
+  };
   const success = await runBrowserScript("public/script.js", {
-    nodes: { categories: tabs },
-    fetchImpl: async () => ({ ok: true, json: async () => categories })
+    nodes,
+    fetchImpl: async url => ({
+      ok: true,
+      json: async () => url === "/api/categories" ? categories : products
+    })
   });
-  assert.deepEqual(success.nodes.categories.children.map(tab => tab.textContent), ["All Products", "Candles", "Pottery"]);
-  assert.equal(success.nodes.categories.children.some(tab => tab.tagName === "img"), false);
-  const failedTabs = uiElement("nav");
+  assert.equal(success.nodes.categories.children.length, 3, "All Products plus API categories render");
+  assert.deepEqual(success.nodes.categories.children.map(card => card.children[1].children[0].textContent), ["All Products", "Candles", "Pottery"]);
+  assert.equal(success.nodes.categories.children[1].href, "products.html?category=1");
+  assert.equal(success.nodes.categories.children[1].children[0].children[1].src, "/uploads/candle.jpg");
+  assert.equal(success.nodes["featured-products"].children.length, 1, "out-of-stock products stay hidden");
+  assert.equal(success.nodes["featured-products"].children[0].children[1].children[0].textContent, "Tree Candle");
+  assert.equal(success.nodes["hero-product-image"].src, "/uploads/candle.jpg");
+});
+test("homepage uses saved HTTPS product images and neutral placeholders for ordinary products", async () => {
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "featured-products": uiElement("div"),
+    "home-products-status": uiElement("p"),
+    "hero-product-image": uiElement("img"),
+    "hero-image-caption": uiElement("span")
+  };
+  const products = [
+    { _id: "cloud", name: "Cloudinary item", categoryId: 4, price: 10, image: "https://res.cloudinary.com/example/image/upload/item.jpg", inStock: true },
+    { _id: "invalid", name: "Invalid image item", categoryId: 4, price: 10, image: "javascript:alert(1)", inStock: true },
+    { _id: "empty", name: "No image item", categoryId: 4, price: 10, image: "", inStock: true }
+  ];
+  const result = await runBrowserScript("public/script.js", {
+    nodes,
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products" ? products : [] })
+  });
+  const cards = result.nodes["featured-products"].children;
+  assert.equal(cards[0].children[0].children[0].src, products[0].image);
+  assert.equal(cards[0].children[0].children[1].hidden, false);
+  cards[0].children[0].children[0].handlers.error();
+  assert.equal(cards[0].children[0].children[0].removed, true);
+  assert.equal(cards[0].children[0].children[1].hidden, false, "failed image requests retain the neutral fallback");
+  assert.equal(cards[1].children[0].children.length, 1);
+  assert.equal(cards[1].children[0].children[0].textContent, "Image unavailable");
+  assert.equal(cards[2].children[0].children[0].textContent, "Image coming soon");
+  assert.ok(cards.every(card => !card.children[0].children[0].className.includes("product-artwork")));
+});
+test("category-specific preview illustrations are limited to labeled local sample products", async () => {
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "featured-products": uiElement("div"),
+    "home-products-status": uiElement("p"),
+    "hero-product-image": uiElement("img"),
+    "hero-image-caption": uiElement("span")
+  };
+  const products = [
+    { _id: "candle", name: "[LOCAL PREVIEW] Sample Candle", categoryId: 1, price: 10, image: "", inStock: true },
+    { _id: "resin", name: "[LOCAL PREVIEW] Sample Resin", categoryId: 2, price: 10, image: "", inStock: true },
+    { _id: "bracelet", name: "[LOCAL PREVIEW] Sample Bracelet", categoryId: 3, price: 10, image: "", inStock: true },
+    { _id: "ordinary", name: "Ordinary Candle", categoryId: 1, price: 10, image: "", inStock: true }
+  ];
+  const result = await runBrowserScript("public/script.js", {
+    nodes,
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products" ? products : [] })
+  });
+  const cards = result.nodes["featured-products"].children;
+  assert.equal(cards[0].children[0].children[0].src, "/uploads/candle.jpg");
+  assert.match(cards[0].children[0].children[1].className, /product-artwork-candle/);
+  assert.match(cards[1].children[0].children[0].className, /product-artwork-resin/);
+  assert.match(cards[2].children[0].children[0].className, /product-artwork-bracelet/);
+  assert.equal(cards[3].children[0].children[0].textContent, "Image coming soon");
+  assert.doesNotMatch(cards[3].children[0].children[0].className, /product-artwork/);
+});
+test("homepage keeps useful API failure and empty states without inventing products", async () => {
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "featured-products": uiElement("div"),
+    "home-products-status": uiElement("p"),
+    "hero-product-image": uiElement("img"),
+    "hero-image-caption": uiElement("span")
+  };
   const failed = await runBrowserScript("public/script.js", {
-    nodes: { categories: failedTabs },
+    nodes,
     fetchImpl: async () => ({ ok: false })
   });
-  assert.equal(failed.nodes.categories.children[0].textContent, "All Products");
-  assert.match(failed.nodes.categories.children.at(-1).textContent, /still browse all products/i);
+  assert.equal(failed.nodes.categories.children.length, 1, "All Products remains available on category API failure");
+  assert.match(failed.nodes["home-category-status"].textContent, /temporarily unavailable/i);
+  assert.equal(failed.nodes["featured-products"].children.length, 0);
+  assert.match(failed.nodes["home-products-status"].textContent, /temporarily unavailable/i);
+
+  const emptyNodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "featured-products": uiElement("div"),
+    "home-products-status": uiElement("p"),
+    "hero-product-image": uiElement("img"),
+    "hero-image-caption": uiElement("span")
+  };
+  const empty = await runBrowserScript("public/script.js", {
+    nodes: emptyNodes,
+    fetchImpl: async () => ({ ok: true, json: async () => [] })
+  });
+  assert.equal(empty.nodes.categories.children.length, 1);
+  assert.match(empty.nodes["home-category-status"].textContent, /No collections/i);
+  assert.match(empty.nodes["home-products-status"].textContent, /no in-stock products/i);
 });
 test("product page uses fetched category names and still renders products if category loading fails", async () => {
   const categoryFilter = uiElement("select");

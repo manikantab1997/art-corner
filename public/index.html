@@ -1,40 +1,73 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="en">
 <head>
-    <title>Art Store</title>
+    <meta charset="UTF-8">
+    <title>Art Corner Bengaluru | Handmade with care</title>
     <link rel="stylesheet" href="style.css">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f9f5e9">
 </head>
-
 <body>
-
     <div id="navbar-container"></div>
 
-    <div class="page-container">
+    <main class="home-page">
+        <section class="home-hero" aria-labelledby="home-title">
+            <div class="hero-copy">
+                <p class="home-eyebrow">THOUGHTFULLY MADE · MADE TO BE KEPT</p>
+                <h1 id="home-title">Handcrafted Store&nbsp;<span aria-hidden="true">✨</span></h1>
+                <p class="hero-subtitle">Beautiful handmade products for your home</p>
+                <p class="hero-description">Discover little details, made by hand and chosen to bring warmth to your everyday.</p>
+                <a class="shop-cta" href="products.html">Shop All Products <span aria-hidden="true">→</span></a>
+                <p class="hero-footnote">A little art for the corners you love.</p>
+            </div>
+            <div class="hero-art" role="img" aria-label="Featured handmade product">
+                <div class="hero-art-scene" aria-hidden="true">
+                    <span class="hero-art-sun"></span>
+                    <span class="hero-art-vessel"></span>
+                    <span class="hero-art-stem hero-art-stem-one"></span>
+                    <span class="hero-art-stem hero-art-stem-two"></span>
+                </div>
+                <img id="hero-product-image" class="hero-product-image" alt="" hidden>
+                <span class="hero-image-caption" id="hero-image-caption">MADE WITH CARE</span>
+                <span class="hero-art-number" aria-hidden="true">01</span>
+            </div>
+        </section>
 
-        <h1>Handcrafted Store ✨</h1>
+        <section class="home-section" aria-labelledby="category-heading">
+            <div class="home-section-heading">
+                <div>
+                    <p class="home-eyebrow">FIND YOUR FAVOURITE</p>
+                    <h2 id="category-heading">Shop by collection</h2>
+                </div>
+                <a class="text-link" href="products.html">View everything <span aria-hidden="true">→</span></a>
+            </div>
+            <p class="home-status" id="home-category-status" role="status" aria-live="polite">Loading collections…</p>
+            <div id="categories" class="home-category-grid" aria-label="Product collections"></div>
+        </section>
 
-        <p class="subtitle">
-            Beautiful handmade products for your home
-        </p>
-
-        <nav id="categories" class="category-tabs" aria-label="Product categories"></nav>
-
-    </div>
+        <section class="home-section home-products-section" aria-labelledby="featured-heading">
+            <div class="home-section-heading">
+                <div>
+                    <p class="home-eyebrow">HANDMADE, JUST FOR YOU</p>
+                    <h2 id="featured-heading">Featured Products</h2>
+                </div>
+                <a class="text-link" href="products.html">Shop all products <span aria-hidden="true">→</span></a>
+            </div>
+            <p class="home-status" id="home-products-status" role="status" aria-live="polite">Finding something lovely…</p>
+            <div id="featured-products" class="home-product-grid"></div>
+        </section>
+    </main>
 
     <div id="footer-container"></div>
 
-<div class="bottom-nav">
-        <a href="index.html">🏠</a>
-        <a href="products.html">🛍️</a>
-        <a href="cart.html">🛒</a>
-        <a href="login.html">👤</a>
+    <div class="bottom-nav">
+        <a href="index.html" aria-label="Home">🏠</a>
+        <a href="products.html" aria-label="Products">🛍️</a>
+        <a href="cart.html" aria-label="Cart">🛒</a>
+        <a href="login.html" aria-label="Admin login">👤</a>
     </div>
 
     <script src="script.js"></script>
     <script src="js/common.js"></script>
-
 </body>
-
 </html>
