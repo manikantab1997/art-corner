@@ -1,6 +1,9 @@
+require("dotenv").config({ quiet: true });
+
 const multer = require("multer");
 const path = require("path");
 const express = require("express");
+const { v2: cloudinary } = require("cloudinary");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const session = require("express-session");
@@ -14,7 +17,52 @@ const publicDirectory = path.join(__dirname, "public");
 const sessionCookieName = "artcorner.sid";
 const sessionMaxAgeMs = 8 * 60 * 60 * 1000;
 const maxAdminPasswordLength = 256;
+const maxProductImageBytes = 5 * 1024 * 1024;
 const validStatuses = ["Placed", "Shipped", "Delivered"];
+const supportedImageTypes = new Map([
+    [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"],
+    [".png", "image/png"], [".webp", "image/webp"], [".gif", "image/gif"]
+]);
+
+function cloudinaryConfigMissing(env = process.env) {
+    return ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+        .filter(name => !env[name] || !env[name].trim());
+}
+
+function configureCloudinary(env = process.env, client = cloudinary) {
+    if (cloudinaryConfigMissing(env).length) return false;
+    client.config({
+        cloud_name: env.CLOUDINARY_CLOUD_NAME,
+        api_key: env.CLOUDINARY_API_KEY,
+        api_secret: env.CLOUDINARY_API_SECRET,
+        secure: true
+    });
+    return true;
+}
+
+function hasSupportedImageSignature(file) {
+    if (!file || !Buffer.isBuffer(file.buffer)) return false;
+    const expectedMime = supportedImageTypes.get(path.extname(file.originalname || "").toLowerCase());
+    if (!expectedMime || file.mimetype !== expectedMime) return false;
+    const buffer = file.buffer;
+    if (expectedMime === "image/jpeg") return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    if (expectedMime === "image/png") return buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if (expectedMime === "image/gif") return buffer.subarray(0, 4).toString("ascii") === "GIF8";
+    if (expectedMime === "image/webp") return buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+    return false;
+}
+
+function uploadImageToCloudinary(file, client = cloudinary) {
+    return new Promise((resolve, reject) => {
+        const stream = client.uploader.upload_stream({ folder: "art-corner/products", resource_type: "image" }, (error, result) => {
+            if (error || !result || typeof result.public_id !== "string" || !/^https:\/\//i.test(result.secure_url || "")) {
+                return reject(new Error("Image storage service could not upload the image"));
+            }
+            resolve({ secureUrl: result.secure_url, publicId: result.public_id });
+        });
+        stream.end(file.buffer);
+    });
+}
 
 const orderSchema = new mongoose.Schema({
     orderId: String,
@@ -48,6 +96,7 @@ const productSchema = new mongoose.Schema({
     categoryId: Number,
     price: Number,
     image: String,
+    imagePublicId: { type: String, select: false, default: undefined },
     inStock: { type: Boolean, default: true }
 });
 const Product = mongoose.model("Product", productSchema);
@@ -163,7 +212,9 @@ function createApp({
     adminPasswordHash,
     production = process.env.NODE_ENV === "production",
     storefrontOrigin = process.env.STOREFRONT_ORIGIN || (production ? null : "http://localhost:3000"),
-    rateLimitStore
+    rateLimitStore,
+    cloudinaryClient = cloudinary,
+    cloudinaryConfigured = cloudinaryConfigMissing().length === 0
 } = {}) {
     const app = express();
     const trustedStorefrontOrigin = validateStorefrontOrigin(storefrontOrigin, { production });
@@ -188,18 +239,15 @@ function createApp({
         }
     }));
 
-    const storage = multer.diskStorage({
-        destination: path.join(publicDirectory, "uploads"),
-        filename: (req, file, cb) => {
-            cb(null, `${Date.now()}${path.extname(file.originalname).toLowerCase()}`);
-        }
-    });
     const upload = multer({
-        storage,
-        limits: { fileSize: 5 * 1024 * 1024 },
+        storage: multer.memoryStorage(),
+        limits: { fileSize: maxProductImageBytes },
         fileFilter: (req, file, cb) => {
-            if (!file.mimetype || !file.mimetype.startsWith("image/")) {
-                return cb(new Error("Uploaded file must be an image"));
+            const extension = path.extname(file.originalname || "").toLowerCase();
+            if (!supportedImageTypes.has(extension) || file.mimetype !== supportedImageTypes.get(extension)) {
+                const error = new Error("Upload a JPEG, PNG, WebP, or GIF image");
+                error.code = "UNSUPPORTED_IMAGE_TYPE";
+                return cb(error);
             }
             cb(null, true);
         }
@@ -436,6 +484,12 @@ function createApp({
         if (!req.file) {
             return res.status(400).json({ error: "A product image is required" });
         }
+        if (!hasSupportedImageSignature(req.file)) {
+            return res.status(400).json({ error: "The uploaded file is not a valid JPEG, PNG, WebP, or GIF image" });
+        }
+        if (!cloudinaryConfigured) {
+            return res.status(503).json({ error: "Product image storage is not configured on this server" });
+        }
         const categoryReservation = await Category.findOneAndUpdate(
             { id: categoryId, deleting: { $ne: true } },
             { $inc: { pendingProductAssignments: 1 } },
@@ -449,13 +503,23 @@ function createApp({
             { id: categoryId, pendingProductAssignments: { $gt: 0 } },
             { $inc: { pendingProductAssignments: -1 } }
         );
+        let uploadedImage;
+        try {
+            uploadedImage = await uploadImageToCloudinary(req.file, cloudinaryClient);
+        } catch {
+            try { await releaseReservation(); } catch { console.error("Product category reservation cleanup failed"); }
+            return res.status(502).json({ error: "Image upload failed. Please try again." });
+        }
+
         let product;
         try {
             product = await new Product({
-                name, price, categoryId, image: `/uploads/${req.file.filename}`
+                name, price, categoryId, image: uploadedImage.secureUrl, imagePublicId: uploadedImage.publicId
             }).save();
         } catch (error) {
-            await releaseReservation();
+            // A rejected database save can have an ambiguous commit result. Retain
+            // the Cloudinary asset rather than risk deleting an image now referenced.
+            try { await releaseReservation(); } catch { console.error("Product category reservation cleanup failed"); }
             throw error;
         }
         try {
@@ -550,7 +614,7 @@ function createApp({
             const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
             return res.status(status).json({ error: error.code === "LIMIT_FILE_SIZE" ? "Image must be 5 MB or smaller" : "Invalid image upload" });
         }
-        if (error.message === "Uploaded file must be an image") {
+        if (error.code === "UNSUPPORTED_IMAGE_TYPE") {
             return res.status(400).json({ error: error.message });
         }
         res.status(500).json({ error: "Something went wrong. Please try again." });
@@ -565,6 +629,7 @@ function validateProductionConfig(env = process.env) {
     }
     const missing = ["MONGO_URI", "SESSION_SECRET", "ADMIN_USERNAME", "ADMIN_PASSWORD_HASH", "STOREFRONT_ORIGIN"]
         .filter(name => !env[name]);
+    missing.push(...cloudinaryConfigMissing(env));
     if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
     if (env.SESSION_SECRET.length < 32 || env.SESSION_SECRET.trim() !== env.SESSION_SECRET) {
         throw new Error("SESSION_SECRET must contain at least 32 characters");
@@ -577,10 +642,12 @@ function validateProductionConfig(env = process.env) {
 
 // Export a memory-backed app for isolated unit tests only. Production startup below
 // creates a separate app with a MongoDB-backed session store and validated secrets.
+configureCloudinary();
 const app = createApp();
 
 async function startServer() {
     validateProductionConfig();
+    configureCloudinary();
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB Connected");
     await seedLegacyCategories();
@@ -610,4 +677,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary };

@@ -8,7 +8,7 @@ const { randomBytes, scryptSync } = require("node:crypto");
 const session = require("express-session");
 const cookieSignature = require("cookie-signature");
 process.env.NODE_ENV = "test";
-const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName } = require("../server");
+const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature } = require("../server");
 
 const originals = new Map();
 function stub(target, name, value) {
@@ -48,7 +48,31 @@ const authApp = createApp({
 });
 const testOrigin = "https://storefront.example.test";
 const testSessionSecret = "integration-test-session-secret-with-more-than-32-characters";
-async function withHttpApp(callback) {
+function makeCloudinaryMock({ fail = false } = {}) {
+  const uploaded = [];
+  const deleted = [];
+  return {
+    uploaded,
+    deleted,
+    uploader: {
+      upload_stream(options, callback) {
+        return { end(buffer) {
+          if (fail) return callback(new Error("provider details must remain private"));
+          const result = { secure_url: "https://images.example.test/art-corner/item.png", public_id: "art-corner/products/item" };
+          uploaded.push({ options, buffer, result });
+          callback(null, result);
+        } };
+      },
+      async destroy(publicId, options) { deleted.push({ publicId, options }); return { result: "ok" }; }
+    }
+  };
+}
+const validPngFile = (name = "product.png") => ({
+  originalname: name,
+  mimetype: "image/png",
+  buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00])
+});
+async function withHttpApp(callback, appOptions = {}) {
   const store = new session.MemoryStore();
   const httpApp = createApp({
     sessionStore: store,
@@ -56,7 +80,8 @@ async function withHttpApp(callback) {
     adminUsername: "test-admin",
     adminPasswordHash: testPasswordHash,
     production: true,
-    storefrontOrigin: testOrigin
+    storefrontOrigin: testOrigin,
+    ...appOptions
   });
   const server = httpApp.listen(0, "127.0.0.1");
   await new Promise((resolve, reject) => {
@@ -278,12 +303,12 @@ async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = 
 test("GET /api/products queries only in-stock products", async () => {
   stub(Product, "find", async filter => {
     assert.deepEqual(filter, { inStock: true });
-    return [{ _id: "p1", name: "Sample", inStock: true }];
+    return [{ _id: "p1", name: "Sample", image: "/uploads/candle.jpg", inStock: true }];
   });
   const handlers = routeStack("get", "/api/products");
   const response = await invoke(handlers.at(-1));
   assert.equal(response.statusCode, 200);
-  assert.deepEqual(response.body, [{ _id: "p1", name: "Sample", inStock: true }]);
+  assert.deepEqual(response.body, [{ _id: "p1", name: "Sample", image: "/uploads/candle.jpg", inStock: true }]);
   restore();
 });
 test("POST /api/products returns a clear error for missing name and required fields", async () => {
@@ -348,12 +373,14 @@ test("refreshing an order confirmation shows the ID without attaching a submit h
 test("production configuration requires explicit production mode and a valid storefront origin", () => {
   const valid = {
     NODE_ENV: "production", MONGO_URI: "mongodb://test.invalid/db", SESSION_SECRET: "x".repeat(40),
-    ADMIN_USERNAME: "test-admin", ADMIN_PASSWORD_HASH: testPasswordHash, STOREFRONT_ORIGIN: "https://storefront.example.test"
+    ADMIN_USERNAME: "test-admin", ADMIN_PASSWORD_HASH: testPasswordHash, STOREFRONT_ORIGIN: "https://storefront.example.test",
+    CLOUDINARY_CLOUD_NAME: "test-cloud", CLOUDINARY_API_KEY: "test-key", CLOUDINARY_API_SECRET: "test-secret"
   };
   assert.doesNotThrow(() => validateProductionConfig(valid));
   assert.throws(() => validateProductionConfig({ ...valid, NODE_ENV: undefined }), /NODE_ENV must be explicitly/);
   assert.throws(() => validateProductionConfig({ ...valid, STOREFRONT_ORIGIN: undefined }), /STOREFRONT_ORIGIN/);
   assert.throws(() => validateProductionConfig({ ...valid, STOREFRONT_ORIGIN: "http://storefront.example.test" }), /HTTPS origin/);
+  assert.throws(() => validateProductionConfig({ ...valid, CLOUDINARY_API_SECRET: undefined }), /CLOUDINARY_API_SECRET/);
 });
 test("HTTP login rotates an existing session ID and sets production cookie flags", async () => {
   await withHttpApp(async ({ store, request }) => {
@@ -397,6 +424,84 @@ test("HTTP admin APIs reject requests without an authenticated session", async (
       assert.match(result.text, /Authentication required/);
     }
   });
+});
+test("unauthenticated multipart product upload is rejected before image processing", async () => {
+  await withHttpApp(async ({ request }) => {
+    const form = new FormData();
+    form.append("image", new Blob([validPngFile().buffer], { type: "image/png" }), "product.png");
+    const result = await request("/api/products", { method: "POST", body: form });
+    assert.equal(result.response.status, 401);
+  });
+});
+test("HTTP product upload rejects unsupported file types and files over 5 MB", async () => {
+  await withHttpApp(async ({ request }) => {
+    const login = await request("/api/admin/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+    });
+    const cookie = sessionCookie(login.setCookies);
+    const unsupported = new FormData();
+    unsupported.append("image", new Blob(["not an image"], { type: "application/pdf" }), "document.pdf");
+    const invalid = await request("/api/products", { method: "POST", cookie, body: unsupported });
+    assert.equal(invalid.response.status, 400);
+    assert.match(invalid.text, /JPEG, PNG, WebP, or GIF/);
+
+    const oversized = new FormData();
+    oversized.append("image", new Blob([Buffer.alloc(5 * 1024 * 1024 + 1)], { type: "image/png" }), "large.png");
+    const tooLarge = await request("/api/products", { method: "POST", cookie, body: oversized });
+    assert.equal(tooLarge.response.status, 413);
+    assert.match(tooLarge.text, /5 MB or smaller/);
+  });
+});
+test("HTTP product upload stores the Cloudinary URL and public ID after upload succeeds", async () => {
+  await withCategoryMocks(async () => {
+    const cloudinaryClient = makeCloudinaryMock();
+    let savedProduct;
+    stub(Product.prototype, "save", async function () { savedProduct = this; return this; });
+    await withHttpApp(async ({ request }) => {
+      const login = await request("/api/admin/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+      });
+      const form = new FormData();
+      form.append("name", "Test candle");
+      form.append("price", "250");
+      form.append("categoryId", "1");
+      form.append("image", new Blob([validPngFile().buffer], { type: "image/png" }), "product.png");
+      const result = await request("/api/products", { method: "POST", cookie: sessionCookie(login.setCookies), body: form });
+      assert.equal(result.response.status, 201);
+      const body = JSON.parse(result.text);
+      assert.equal(body.product.image, "https://images.example.test/art-corner/item.png");
+      assert.equal(savedProduct.imagePublicId, "art-corner/products/item");
+      assert.equal(cloudinaryClient.uploaded.length, 1);
+      assert.equal(cloudinaryClient.uploaded[0].options.folder, "art-corner/products");
+    }, { cloudinaryClient, cloudinaryConfigured: true });
+  });
+  restore();
+});
+test("HTTP Cloudinary failure returns a safe error and does not save a product", async () => {
+  await withCategoryMocks(async () => {
+    const cloudinaryClient = makeCloudinaryMock({ fail: true });
+    let saved = false;
+    stub(Product.prototype, "save", async function () { saved = true; return this; });
+    await withHttpApp(async ({ request }) => {
+      const login = await request("/api/admin/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
+      });
+      const form = new FormData();
+      form.append("name", "Test candle");
+      form.append("price", "250");
+      form.append("categoryId", "1");
+      form.append("image", new Blob([validPngFile().buffer], { type: "image/png" }), "product.png");
+      const result = await request("/api/products", { method: "POST", cookie: sessionCookie(login.setCookies), body: form });
+      assert.equal(result.response.status, 502);
+      assert.match(result.text, /Image upload failed/);
+      assert.doesNotMatch(result.text, /provider details/);
+      assert.equal(saved, false);
+    }, { cloudinaryClient, cloudinaryConfigured: true });
+  });
+  restore();
 });
 test("HTTP cookie authorizes protected API and logout invalidates it", async () => {
   await withHttpApp(async ({ request }) => {
@@ -547,8 +652,9 @@ test("product creation rejects a category ID that is not present", async () => {
     return null;
   });
   try {
-    const result = await invoke(routeStack("post", "/api/products").at(-1), {
-      body: { name: "Sample", price: "10", categoryId: "99" }, file: { filename: "test.jpg" }
+    const uploadApp = createApp({ cloudinaryConfigured: true, cloudinaryClient: makeCloudinaryMock() });
+    const result = await invoke(routeStack("post", "/api/products", uploadApp).at(-1), {
+      body: { name: "Sample", price: "10", categoryId: "99" }, file: validPngFile()
     });
     assert.equal(result.statusCode, 400);
     assert.equal(result.body.error, "Selected category does not exist or is being deleted");
@@ -569,12 +675,67 @@ test("product creation reserves and releases a category assignment atomically", 
     return { matchedCount: 1 };
   });
   stub(Product.prototype, "save", async function () { return this; });
+  const cloudinaryClient = makeCloudinaryMock();
   try {
-    const result = await invoke(routeStack("post", "/api/products").at(-1), {
-      body: { name: "Sample", price: "10", categoryId: "1" }, file: { filename: "test.jpg" }
+    const uploadApp = createApp({ cloudinaryConfigured: true, cloudinaryClient });
+    const result = await invoke(routeStack("post", "/api/products", uploadApp).at(-1), {
+      body: { name: "Sample", price: "10", categoryId: "1" }, file: validPngFile()
     });
     assert.equal(result.statusCode, 201);
     assert.equal(released, true);
+    assert.equal(result.body.product.image, "https://images.example.test/art-corner/item.png");
+    assert.equal(result.body.product.imagePublicId, "art-corner/products/item");
+    assert.equal(cloudinaryClient.uploaded.length, 1);
+  } finally {
+    restore();
+  }
+});
+test("product upload rejects files without a supported matching image signature", async () => {
+  const invalid = { ...validPngFile(), buffer: Buffer.from("not an image") };
+  assert.equal(hasSupportedImageSignature(invalid), false);
+  assert.equal(hasSupportedImageSignature({ ...validPngFile(), originalname: "file.exe" }), false);
+});
+test("legacy local product image paths remain served during the Cloudinary transition", async () => {
+  await withHttpApp(async ({ request }) => {
+    const result = await request("/uploads/candle.jpg");
+    assert.equal(result.response.status, 200);
+    assert.match(result.response.headers.get("content-type"), /image\/jpeg/);
+  });
+});
+test("Cloudinary upload failure preserves category reservation cleanup and creates no product", async () => {
+  let released = false;
+  let saved = false;
+  stub(Category, "findOneAndUpdate", async () => ({ id: 1 }));
+  stub(Category, "updateOne", async () => { released = true; return { matchedCount: 1 }; });
+  stub(Product.prototype, "save", async function () { saved = true; return this; });
+  try {
+    const cloudinaryClient = makeCloudinaryMock({ fail: true });
+    const uploadApp = createApp({ cloudinaryConfigured: true, cloudinaryClient });
+    const result = await invoke(routeStack("post", "/api/products", uploadApp).at(-1), {
+      body: { name: "Sample", price: "10", categoryId: "1" }, file: validPngFile()
+    });
+    assert.equal(result.statusCode, 502);
+    assert.match(result.body.error, /Image upload failed/);
+    assert.equal(saved, false);
+    assert.equal(released, true);
+  } finally {
+    restore();
+  }
+});
+test("product save failure retains the newly uploaded image when database outcome is uncertain", async () => {
+  let released = false;
+  stub(Category, "findOneAndUpdate", async () => ({ id: 1 }));
+  stub(Category, "updateOne", async () => { released = true; return { matchedCount: 1 }; });
+  stub(Product.prototype, "save", async function () { throw new Error("simulated database write failure"); });
+  const cloudinaryClient = makeCloudinaryMock();
+  try {
+    const uploadApp = createApp({ cloudinaryConfigured: true, cloudinaryClient });
+    await assert.rejects(invoke(routeStack("post", "/api/products", uploadApp).at(-1), {
+      body: { name: "Sample", price: "10", categoryId: "1" }, file: validPngFile()
+    }), /simulated database write failure/);
+    assert.equal(released, true);
+    assert.equal(cloudinaryClient.uploaded.length, 1);
+    assert.deepEqual(cloudinaryClient.deleted, []);
   } finally {
     restore();
   }
