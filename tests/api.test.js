@@ -9,7 +9,7 @@ const { randomBytes, scryptSync } = require("node:crypto");
 process.env.NODE_ENV = "test";
 const session = require("express-session");
 const cookieSignature = require("cookie-signature");
-const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady } = require("../server");
+const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady, runStartupStage } = require("../server");
 
 const originals = new Map();
 function stub(target, name, value) {
@@ -788,6 +788,33 @@ test("session store readiness check blocks startup on initialization errors", as
   assert.equal(probedId, "__startup_readiness_check__");
   await assert.rejects(verifySessionStoreReady({ get(_id, callback) { callback(new Error("store initialization failed")); } }), /store initialization failed/);
   await assert.rejects(verifySessionStoreReady(null), /valid session store/);
+});
+test("session store readiness check fails promptly if the store never calls back", async () => {
+  let lateCallback;
+  await assert.rejects(
+    verifySessionStoreReady({ get(_id, callback) { lateCallback = callback; } }, 10),
+    /Session store readiness check timed out after 10 ms/
+  );
+  assert.equal(typeof lateCallback, "function");
+  assert.doesNotThrow(() => lateCallback(null, null));
+});
+test("startup stage diagnostics log timing and rethrow failures", async () => {
+  const logs = [];
+  const logger = {
+    log(message) { logs.push(message); },
+    error(message) { logs.push(message); }
+  };
+  const result = await runStartupStage("test stage", async () => "ready", logger);
+  assert.equal(result, "ready");
+  assert.match(logs[0], /Startup stage "test stage" started/);
+  assert.match(logs[1], /Startup stage "test stage" completed in \d+ ms/);
+
+  const failure = new Error("private details should not be logged");
+  logs.length = 0;
+  await assert.rejects(runStartupStage("failing stage", async () => { throw failure; }, logger), error => error === failure);
+  assert.match(logs[0], /Startup stage "failing stage" started/);
+  assert.match(logs[1], /Startup stage "failing stage" failed after \d+ ms \(Error\)/);
+  assert.doesNotMatch(logs.join(" "), /private details/);
 });
 test("HTTP login rotates an existing session ID and sets production cookie flags", async () => {
   await withHttpApp(async ({ store, request }) => {

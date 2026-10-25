@@ -883,7 +883,7 @@ function createApp({
     return app;
 }
 
-function verifySessionStoreReady(store) {
+function verifySessionStoreReady(store, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
         if (!store || typeof store.get !== "function") {
             reject(new Error("A valid session store is required before startup"));
@@ -891,8 +891,37 @@ function verifySessionStoreReady(store) {
         }
         // connect-mongo initializes its collection and TTL index on first use.
         // Probe with a non-existent ID so those failures happen before listen().
-        store.get("__startup_readiness_check__", error => error ? reject(error) : resolve());
+        let settled = false;
+        const timeout = setTimeout(() => {
+            settled = true;
+            reject(new Error(`Session store readiness check timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+        const finish = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            if (error) reject(error);
+            else resolve();
+        };
+        try {
+            store.get("__startup_readiness_check__", finish);
+        } catch (error) {
+            finish(error);
+        }
     });
+}
+
+async function runStartupStage(stageName, operation, logger = console) {
+    const startedAt = Date.now();
+    logger.log(`Startup stage "${stageName}" started`);
+    try {
+        const result = await operation();
+        logger.log(`Startup stage "${stageName}" completed in ${Date.now() - startedAt} ms`);
+        return result;
+    } catch (error) {
+        logger.error(`Startup stage "${stageName}" failed after ${Date.now() - startedAt} ms (${error?.name || "Error"})`);
+        throw error;
+    }
 }
 
 function validateProductionConfig(env = process.env) {
@@ -922,8 +951,8 @@ async function startServer() {
     configureCloudinary();
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB Connected");
-    await seedLegacyCategories();
-    await Order.createIndexes();
+    await runStartupStage("legacy category seeding", seedLegacyCategories);
+    await runStartupStage("order index creation", () => Order.createIndexes());
     const store = MongoStore.create({
         client: mongoose.connection.getClient(),
         dbName: mongoose.connection.name,
@@ -931,7 +960,7 @@ async function startServer() {
         ttl: sessionMaxAgeMs / 1000,
         autoRemove: "native"
     });
-    await verifySessionStoreReady(store);
+    await runStartupStage("MongoDB session-store readiness", () => verifySessionStoreReady(store));
     const productionApp = createApp({
         sessionStore: store,
         sessionSecret: process.env.SESSION_SECRET,
@@ -946,9 +975,9 @@ async function startServer() {
 
 if (require.main === module) {
     startServer().catch(error => {
-        console.error("Server startup failed:", error.message);
+        console.error(`Server startup failed (${error?.name || "Error"})`);
         process.exitCode = 1;
     });
 }
 
-module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady, runStartupStage };
