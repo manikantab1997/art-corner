@@ -4,11 +4,12 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const path = require("node:path");
 const http = require("node:http");
+const { spawnSync } = require("node:child_process");
 const { randomBytes, scryptSync } = require("node:crypto");
+process.env.NODE_ENV = "test";
 const session = require("express-session");
 const cookieSignature = require("cookie-signature");
-process.env.NODE_ENV = "test";
-const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature } = require("../server");
+const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady } = require("../server");
 
 const originals = new Map();
 function stub(target, name, value) {
@@ -38,6 +39,13 @@ async function invoke(handler, { params = {}, body = {}, file, reqSession = {}, 
 }
 const testSalt = randomBytes(16);
 const testPasswordHash = `scrypt$${testSalt.toString("hex")}$${scryptSync("test-only-password", testSalt, 64).toString("hex")}`;
+class HttpTestSessionStore extends session.Store {
+  constructor() { super(); this.sessions = new Map(); }
+  get(id, callback) { callback(null, this.sessions.get(id) || null); }
+  set(id, value, callback) { this.sessions.set(id, value); callback?.(null); }
+  destroy(id, callback) { this.sessions.delete(id); callback?.(null); }
+  touch(id, value, callback) { if (this.sessions.has(id)) this.sessions.set(id, value); callback?.(null); }
+}
 const authApp = createApp({
   sessionStore: new session.MemoryStore(),
   sessionSecret: "test-only-session-secret-with-enough-length",
@@ -73,7 +81,7 @@ const validPngFile = (name = "product.png") => ({
   buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00])
 });
 async function withHttpApp(callback, appOptions = {}) {
-  const store = new session.MemoryStore();
+  const store = new HttpTestSessionStore();
   const httpApp = createApp({
     sessionStore: store,
     sessionSecret: testSessionSecret,
@@ -239,23 +247,27 @@ function seedSession(store, sid, isAdmin = false) {
 function signedSessionCookie(sid) {
   return `${sessionCookieName}=${encodeURIComponent(`s:${cookieSignature.sign(sid, testSessionSecret)}`)}`;
 }
-function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", qty: 1 }], fetchImpl = async () => ({ ok: true, status: 201, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000" }) }) } = {}) {
+function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", price: 250, qty: 1 }], fetchImpl = async () => ({ ok: true, status: 201, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9", confirmationToken: "signed-test-token" }) }) } = {}) {
   const storage = new Map();
   if (cart !== undefined) storage.set("cart", JSON.stringify(cart));
   const nodes = {
-    checkoutForm: { hidden: false, onsubmit: null, querySelector: () => ({ disabled: false }) },
+    checkoutForm: { hidden: false, onsubmit: null, querySelector: () => ({ disabled: false }), reportValidity() { this.reported = true; } },
     checkoutFeedback: { textContent: "" },
-    orderConfirmation: { hidden: true },
-    orderConfirmationId: { textContent: "" },
-    name: { value: "A Customer" }, phone: { value: "9876543210" },
-    email: { value: "customer@example.com" }, address: { value: "Bengaluru" }
+    legacyOrderNotice: { hidden: true }, legacyOrderNoticeText: { textContent: "" },
+    checkoutSummaryItems: uiElement("div"), checkoutSummaryTotal: { textContent: "" },
+    placeOrderButton: { disabled: false, textContent: "Place Order" },
+    name: { value: "A Customer", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    phone: { value: "9876543210", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    email: { value: "customer@example.com", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    address: { value: "Bengaluru delivery address", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    nameError: { textContent: "" }, phoneError: { textContent: "" }, emailError: { textContent: "" }, addressError: { textContent: "" }
   };
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" } };
   const localStorage = {
     getItem: key => storage.has(key) ? storage.get(key) : null,
     removeItem: key => storage.delete(key)
   };
-  const document = { getElementById: id => nodes[id] };
+  const document = { getElementById: id => nodes[id], createElement: tag => uiElement(tag) };
   const source = fs.readFileSync(path.join(__dirname, "../public/checkout.js"), "utf8");
   const sessionStorage = {
     getItem: key => storage.has(key) ? storage.get(key) : null,
@@ -268,6 +280,22 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", qty
   });
   return { nodes, window, storage, sessionStorage };
 }
+async function cartBrowser({ cart = [], products = [{ _id: "p1", inStock: true }] } = {}) {
+  const storage = new Map([...(cart === undefined ? [] : [["cart", JSON.stringify(cart)]])]);
+  const nodes = { cart: uiElement("section"), subtotal: uiElement("strong"), total: uiElement("strong"), cartStatus: uiElement("p"), checkoutLink: uiElement("a") };
+  const listeners = {};
+  const localStorage = {
+    getItem: key => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+    removeItem: key => storage.delete(key)
+  };
+  const window = { history: { back() {} }, addEventListener: (name, callback) => { listeners[name] = callback; }, dispatchEvent() {} };
+  const document = { getElementById: id => nodes[id], createElement: tag => uiElement(tag) };
+  const source = fs.readFileSync(path.join(__dirname, "../public/cart.js"), "utf8");
+  vm.runInNewContext(source, { document, window, localStorage, fetch: async () => ({ ok: true, json: async () => products }), console, URL });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  return { nodes, storage, listeners };
+}
 function uiElement(tagName = "div") {
   return {
     tagName,
@@ -276,6 +304,13 @@ function uiElement(tagName = "div") {
     attributes: {},
     className: "",
     style: {},
+    classList: {
+      values: new Set(),
+      add(value) { this.values.add(value); },
+      remove(value) { this.values.delete(value); },
+      toggle(value, force) { const next = force === undefined ? !this.values.has(value) : force; next ? this.values.add(value) : this.values.delete(value); return next; },
+      contains(value) { return this.values.has(value); }
+    },
     value: "",
     textContent: "",
     hidden: false,
@@ -293,8 +328,10 @@ function uiElement(tagName = "div") {
     querySelector(selector) { return this.children.find(child => child.className === selector.slice(1)) || null; }
   };
 }
-async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true } = {}) {
-  const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" } };
+async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, stored = {} } = {}) {
+  const storage = new Map(Object.entries(stored));
+  const localStorage = { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) };
+  const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" }, addEventListener() {}, dispatchEvent() {} };
   const document = {
     getElementById: id => nodes[id] || null,
     createElement: tag => uiElement(tag),
@@ -302,12 +339,12 @@ async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = 
   };
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
-    document, window: { ...window, confirm: confirmImpl }, fetch: fetchImpl, console, URLSearchParams,
+    document, window: { ...window, confirm: confirmImpl }, localStorage, fetch: fetchImpl, console, URLSearchParams,
     URL, encodeURIComponent, requireAdminPage, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
     FormData: class { append() {} }, alert() {}
   });
   await new Promise(resolve => setTimeout(resolve, 0));
-  return { window, nodes };
+  return { window, nodes, storage };
 }
 
 test("GET /api/products queries only in-stock products", async () => {
@@ -356,6 +393,8 @@ test("POST /api/orders returns a persisted order ID in a success response", asyn
     });
     assert.equal(response.statusCode, 201);
     assert.match(response.body.orderId, /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.match(response.body.publicReference, /^AC-[A-HJ-NP-Z2-9]{5}$/);
+    assert.match(response.body.confirmationToken, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
     const missingKey = await invoke(routeStack("post", "/api/orders").at(-1), {
       body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] }
     });
@@ -456,7 +495,9 @@ test("checkout idempotency returns the existing order without sending a second n
       body: savedPayload, headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.body, { orderId: "ORD-existing" });
+    assert.equal(response.body.orderId, "ORD-existing");
+    assert.equal(response.body.publicReference, "ORD-existing");
+    assert.equal(typeof response.body.confirmationToken, "string");
     assert.equal(lookupFilter.idempotencyKey, "123e4567-e89b-42d3-a456-426614174000");
     const conflict = await invoke(routeStack("post", "/api/orders").at(-1), {
       body: { ...savedPayload, items: [{ name: "Changed item", price: 10, qty: 1 }] },
@@ -519,17 +560,85 @@ test("public footer uses the exact business profiles with accessible external li
   assert.doesNotMatch(footer, /wa\.me\/919999999999|href="https?:\/\/instagram\.com"/);
   assert.match(footer, /target="_blank" rel="noopener noreferrer" aria-label=/);
 });
-test("checkout clears cart only after a confirmed response and redirects to the confirmation URL", async () => {
+test("checkout clears cart only after a confirmed response and redirects to the dedicated confirmation page", async () => {
   const browser = checkoutBrowser();
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), false);
-  assert.match(browser.window.location.href, /^checkout\.html\?orderId=ORD-/);
+  assert.equal(browser.window.location.href, "order-success.html");
+  assert.ok(browser.sessionStorage.getItem("artcorner.order.confirmation"));
 });
 test("checkout failure preserves cart and shows an error", async () => {
   const browser = checkoutBrowser({ fetchImpl: async () => ({ ok: false, json: async () => ({ error: "Order save failed" }) }) });
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.checkoutFeedback.textContent, /Order save failed/);
+});
+test("cart renders Cloudinary images, totals quantities, and persists quantity/removal controls", async () => {
+  const browser = await cartBrowser({
+    cart: [{ _id: "p1", name: "Resin tray", price: 125.5, qty: 2, image: "https://res.cloudinary.com/example/image/upload/tray.jpg" }]
+  });
+  const card = browser.nodes.cart.children[0];
+  const image = card.children[0].children[0];
+  assert.equal(image.src, "https://res.cloudinary.com/example/image/upload/tray.jpg");
+  assert.equal(browser.nodes.subtotal.textContent, "₹251.00");
+  const controls = card.children[2];
+  controls.children[1].children[2].handlers.click();
+  assert.equal(JSON.parse(browser.storage.get("cart"))[0].qty, 3);
+  browser.nodes.cart.children[0].children[2].children[2].handlers.click();
+  assert.deepEqual(JSON.parse(browser.storage.get("cart")), []);
+  assert.equal(browser.nodes.cart.children[0].className, "cart-empty-state");
+});
+test("cart shows an empty state and keeps checkout hidden when empty", async () => {
+  const browser = await cartBrowser({ cart: [] });
+  assert.equal(browser.nodes.cart.children[0].className, "cart-empty-state");
+  assert.equal(browser.nodes.checkoutLink.hidden, true);
+  assert.equal(browser.nodes.total.textContent, "₹0.00");
+});
+test("shared navigation synchronizes cart badges and supports accessible mobile drawer controls", () => {
+  const badgeLink = uiElement("a");
+  const badge = uiElement("span");
+  badge.closest = () => badgeLink;
+  const toggle = uiElement("button");
+  const close = uiElement("button");
+  const backdrop = uiElement("button");
+  backdrop.hidden = true;
+  const menu = uiElement("aside");
+  menu.removeAttribute = name => { delete menu.attributes[name]; };
+  const homeLink = uiElement("a");
+  homeLink.href = "index.html";
+  const finalLink = uiElement("a");
+  finalLink.href = "login.html";
+  menu.querySelectorAll = selector => selector.includes("a[href]") ? [homeLink, finalLink] : [homeLink, finalLink, close];
+  const root = { querySelector: selector => ({
+    "#mobileMenuToggle": toggle, "#mobileMenu": menu, "#mobileMenuClose": close, "#mobileMenuBackdrop": backdrop
+  })[selector] || null };
+  const keyHandlers = {};
+  const windowHandlers = {};
+  const document = {
+    body: { classList: uiElement().classList }, activeElement: null,
+    querySelectorAll: () => [badge], addEventListener: (name, handler) => { keyHandlers[name] = handler; },
+    getElementById: () => null
+  };
+  const storage = new Map([["cart", JSON.stringify([{ qty: 2 }, { qty: 1 }])]]);
+  const window = { addEventListener: (name, handler) => { windowHandlers[name] = handler; }, dispatchEvent() {} };
+  const source = fs.readFileSync(path.join(__dirname, "../public/js/common.js"), "utf8");
+  const context = vm.createContext({ document, window, localStorage: { getItem: key => storage.get(key) }, Event: class {}, fetch: async () => ({ ok: true, text: async () => "" }), console });
+  vm.runInContext(source, context);
+  context.updateCartBadges();
+  assert.equal(badge.textContent, "3");
+  assert.equal(badge.hidden, false);
+  assert.equal(badgeLink.attributes["aria-label"], "Cart, 3 items");
+  context.setupMobileNavigation(root);
+  toggle.handlers.click();
+  assert.equal(toggle.attributes["aria-expanded"], "true");
+  assert.equal(menu.attributes["aria-hidden"], "false");
+  assert.equal(document.body.classList.contains("mobile-menu-open"), true);
+  let prevented = false;
+  keyHandlers.keydown({ key: "Escape", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(toggle.attributes["aria-expanded"], "false");
+  assert.equal(backdrop.hidden, true);
+  assert.equal(typeof windowHandlers.storage, "function");
 });
 test("checkout reuses its idempotency key after a failed request and clears it only on confirmed success", async () => {
   let postedKey;
@@ -543,20 +652,100 @@ test("checkout reuses its idempotency key after a failed request and clears it o
   assert.equal(failed.storage.get("artcorner.checkout.idempotencyKey"), postedKey);
   const succeeded = checkoutBrowser({ fetchImpl: async (_url, options) => {
     assert.equal(options.headers["Idempotency-Key"], postedKey);
-    return { ok: true, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000" }) };
+    return { ok: true, json: async () => ({
+      orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9", confirmationToken: "signed-test-token"
+    }) };
   } });
   succeeded.storage.set("artcorner.checkout.idempotencyKey", postedKey);
   await succeeded.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(succeeded.storage.has("cart"), false);
   assert.equal(succeeded.storage.has("artcorner.checkout.idempotencyKey"), false);
 });
-test("refreshing an order confirmation shows the ID without attaching a submit handler", () => {
+test("checkout rejects invalid customer details without sending or clearing the cart", async () => {
+  let requests = 0;
+  const browser = checkoutBrowser({ fetchImpl: async () => { requests++; throw new Error("should not submit"); } });
+  browser.nodes.email.value = "invalid-address";
+  await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(requests, 0);
+  assert.equal(browser.storage.has("cart"), true);
+  assert.match(browser.nodes.emailError.textContent, /valid email/i);
+  assert.match(browser.nodes.checkoutFeedback.textContent, /highlighted details/i);
+});
+test("legacy confirmation URL is not accepted as proof and does not submit checkout", () => {
   const orderId = "ORD-123e4567-e89b-42d3-a456-426614174000";
   const browser = checkoutBrowser({ search: `?orderId=${orderId}`, cart: undefined, fetchImpl: async () => { throw new Error("unexpected request"); } });
-  assert.equal(browser.nodes.orderConfirmation.hidden, false);
-  assert.equal(browser.nodes.orderConfirmationId.textContent, orderId);
+  assert.equal(browser.nodes.legacyOrderNotice.hidden, false);
+  assert.match(browser.nodes.legacyOrderNoticeText.textContent, new RegExp(orderId));
+  assert.match(browser.nodes.legacyOrderNoticeText.textContent, /cannot be verified/i);
   assert.equal(browser.nodes.checkoutForm.hidden, true);
   assert.equal(browser.nodes.checkoutForm.onsubmit, null);
+});
+
+test("public order references are short and confirmation tokens expire safely", () => {
+  const references = Array.from({ length: 100 }, generatePublicOrderReference);
+  assert.ok(references.every(reference => /^AC-[A-HJ-NP-Z2-9]{5}$/.test(reference)));
+  const token = createOrderConfirmationToken("AC-7K2P9", "unit-test-secret", 1000);
+  assert.equal(verifyOrderConfirmationToken(token, "unit-test-secret", 1001), "AC-7K2P9");
+  assert.equal(verifyOrderConfirmationToken(token, "wrong-secret", 1001), null);
+  assert.equal(verifyOrderConfirmationToken(token, "unit-test-secret", 1000 + 7 * 24 * 60 * 60 * 1000), null);
+});
+test("order public references have a unique partial index and retry reference collisions", async () => {
+  const referenceIndex = Order.schema.indexes().find(([keys]) => keys.publicReference === 1);
+  assert.ok(referenceIndex);
+  assert.equal(referenceIndex[1].unique, true);
+  assert.deepEqual(referenceIndex[1].partialFilterExpression, { publicReference: { $type: "string" } });
+  const originalSave = Order.prototype.save;
+  let attempts = 0;
+  let firstReference;
+  Order.prototype.save = async function () {
+    attempts++;
+    if (attempts === 1) {
+      firstReference = this.publicReference;
+      const error = new Error("duplicate public reference");
+      error.code = 11000;
+      error.keyPattern = { publicReference: 1 };
+      throw error;
+    }
+    return this;
+  };
+  try {
+    const response = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] },
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(response.statusCode, 201);
+    assert.equal(attempts, 2);
+    assert.notEqual(response.body.publicReference, firstReference);
+  } finally {
+    Order.prototype.save = originalSave;
+  }
+});
+
+test("order confirmation API requires a valid token and returns only a safe order summary", async () => {
+  const originalFindOne = Order.findOne;
+  let filter;
+  Order.findOne = value => {
+    filter = value;
+    return { select() { return { lean: async () => ({
+      publicReference: "AC-7K2P9", status: "Placed", customer: { name: "Private customer" },
+      items: [{ name: "Candle", qty: 2, price: 100 }]
+    }) }; } };
+  };
+  try {
+    const handler = routeStack("get", "/api/order-confirmation", authApp).at(-1);
+    const invalid = await invoke(handler, { headers: { "x-order-confirmation": "bad" } });
+    assert.equal(invalid.statusCode, 401);
+    const token = createOrderConfirmationToken("AC-7K2P9", "test-only-session-secret-with-enough-length");
+    const response = await invoke(handler, { headers: { "x-order-confirmation": token } });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(filter, { publicReference: "AC-7K2P9" });
+    assert.deepEqual(response.body, {
+      publicReference: "AC-7K2P9", status: "Placed", items: [{ name: "Candle", qty: 2, price: 100 }]
+    });
+    assert.equal(JSON.stringify(response.body).includes("Private customer"), false);
+  } finally {
+    Order.findOne = originalFindOne;
+  }
 });
 
 test("production configuration requires explicit production mode and a valid storefront origin", () => {
@@ -570,6 +759,26 @@ test("production configuration requires explicit production mode and a valid sto
   assert.throws(() => validateProductionConfig({ ...valid, STOREFRONT_ORIGIN: undefined }), /STOREFRONT_ORIGIN/);
   assert.throws(() => validateProductionConfig({ ...valid, STOREFRONT_ORIGIN: "http://storefront.example.test" }), /HTTPS origin/);
   assert.throws(() => validateProductionConfig({ ...valid, CLOUDINARY_API_SECRET: undefined }), /CLOUDINARY_API_SECRET/);
+});
+test("production createApp requires an explicitly configured persistent session store", () => {
+  assert.throws(() => createApp({ production: true }), /persistent session store is required in production/i);
+  assert.throws(() => createApp({ production: true, sessionStore: new session.MemoryStore() }), /persistent session store is required in production/i);
+});
+test("production module import does not construct an unused MemoryStore application", () => {
+  const child = spawnSync(process.execPath, ["-e", 'const { app } = require("./server"); if (app !== null) process.exitCode = 2;'], {
+    cwd: path.resolve(__dirname, ".."),
+    env: { ...process.env, NODE_ENV: "production" },
+    encoding: "utf8"
+  });
+  assert.equal(child.status, 0, child.stderr);
+  assert.doesNotMatch(child.stderr, /MemoryStore is not designed for a production environment/i);
+});
+test("session store readiness check blocks startup on initialization errors", async () => {
+  let probedId;
+  await verifySessionStoreReady({ get(id, callback) { probedId = id; callback(null, null); } });
+  assert.equal(probedId, "__startup_readiness_check__");
+  await assert.rejects(verifySessionStoreReady({ get(_id, callback) { callback(new Error("store initialization failed")); } }), /store initialization failed/);
+  await assert.rejects(verifySessionStoreReady(null), /valid session store/);
 });
 test("HTTP login rotates an existing session ID and sets production cookie flags", async () => {
   await withHttpApp(async ({ store, request }) => {

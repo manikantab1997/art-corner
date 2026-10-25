@@ -11,34 +11,51 @@
 
   <div id="navbar-container"></div>
 
-  <div class="page-container">
-
+  <main class="page-container checkout-page">
+    <p class="home-eyebrow">A FEW DETAILS AND IT'S YOURS</p>
     <h1>Checkout</h1>
-    <p id="checkoutFeedback" role="status" aria-live="polite"></p>
-
-    <section id="orderConfirmation" class="checkout-form" aria-live="polite" hidden>
-      <h2>Order confirmed</h2>
-      <p>Thank you. Your order ID is <strong id="orderConfirmationId"></strong>.</p>
-      <a href="products.html">Continue shopping</a>
+    <p id="checkoutFeedback" class="checkout-feedback" role="status" aria-live="polite"></p>
+    <section id="legacyOrderNotice" class="checkout-recovery" role="status" hidden>
+      <h2>Older order confirmation link</h2>
+      <p id="legacyOrderNoticeText"></p>
+      <a class="secondary-link-button" href="products.html">Continue Shopping</a>
     </section>
 
-    <form id="checkoutForm" class="checkout-form">
+    <div class="checkout-layout">
+      <form id="checkoutForm" class="checkout-form" novalidate>
+        <section class="checkout-field-group" aria-labelledby="contactDetailsTitle">
+          <h2 id="contactDetailsTitle">Contact details</h2>
+          <label for="name">Full name</label>
+          <input type="text" id="name" name="name" autocomplete="name" minlength="2" maxlength="120" required aria-describedby="nameError">
+          <small class="field-error" id="nameError"></small>
 
-      <input type="text" id="name" placeholder="Full Name" required>
+          <label for="phone">Phone number</label>
+          <input type="tel" id="phone" name="phone" autocomplete="tel" inputmode="tel" pattern="[+0-9() .-]{7,20}" required aria-describedby="phoneError">
+          <small class="field-error" id="phoneError"></small>
 
-      <input type="text" id="phone" placeholder="Phone Number" required>
+          <label for="email">Email address</label>
+          <input type="email" id="email" name="email" autocomplete="email" maxlength="254" required aria-describedby="emailError">
+          <small class="field-error" id="emailError"></small>
+        </section>
 
-      <input type="email" id="email" placeholder="Email Address" required>
+        <section class="checkout-field-group" aria-labelledby="deliveryDetailsTitle">
+          <h2 id="deliveryDetailsTitle">Delivery details</h2>
+          <label for="address">Delivery address</label>
+          <textarea id="address" name="address" autocomplete="street-address" minlength="8" maxlength="500" required aria-describedby="addressError"></textarea>
+          <small class="field-error" id="addressError"></small>
+        </section>
+        <button id="placeOrderButton" class="primary-button" type="submit">Place Order</button>
+        <a class="checkout-back-link" href="cart.html">← Back to cart</a>
+      </form>
 
-      <textarea id="address" placeholder="Shipping Address" required></textarea>
-
-      <button type="submit">
-        Place Order
-      </button>
-
-    </form>
-
-  </div>
+      <aside class="checkout-summary" aria-labelledby="checkoutSummaryTitle">
+        <h2 id="checkoutSummaryTitle">Order summary</h2>
+        <div id="checkoutSummaryItems" class="checkout-summary-items"></div>
+        <p class="checkout-summary-total"><span>Total</span><strong id="checkoutSummaryTotal">₹0.00</strong></p>
+        <p class="checkout-summary-note">No payment is taken on this page. The store will follow up about your order.</p>
+      </aside>
+    </div>
+  </main>
 
   <div id="footer-container"></div>
 

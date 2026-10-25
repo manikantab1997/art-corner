@@ -60,8 +60,16 @@ addButton.onclick = () => {
   let cart = [];
   try { cart = JSON.parse(localStorage.getItem("cart") || "[]"); } catch { cart = []; }
   const existing = cart.find(item => item._id === currentProduct._id);
-  if (existing) existing.qty = Number(existing.qty || 1) + 1;
+  if (existing) {
+    const quantity = Number.isSafeInteger(Number(existing.qty)) && Number(existing.qty) > 0 ? Number(existing.qty) : 1;
+    if (quantity >= 99) {
+      addButton.textContent = "Maximum quantity reached";
+      return;
+    }
+    existing.qty = quantity + 1;
+  }
   else cart.push({ ...currentProduct, qty: 1 });
   localStorage.setItem("cart", JSON.stringify(cart));
+  if (typeof announceCartUpdated === "function") announceCartUpdated();
   addButton.textContent = "Added to cart";
 };

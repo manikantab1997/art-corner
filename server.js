@@ -9,7 +9,7 @@ const mongoose = require("mongoose");
 const session = require("express-session");
 const { MongoStore } = require("connect-mongo");
 const { rateLimit } = require("express-rate-limit");
-const { randomUUID, randomBytes, createHash, scrypt, timingSafeEqual } = require("crypto");
+const { randomUUID, randomBytes, createHash, createHmac, scrypt, timingSafeEqual } = require("crypto");
 const { promisify } = require("util");
 
 const scryptAsync = promisify(scrypt);
@@ -66,6 +66,7 @@ function uploadImageToCloudinary(file, client = cloudinary) {
 
 const orderSchema = new mongoose.Schema({
     orderId: String,
+    publicReference: { type: String, default: undefined },
     customer: { name: String, phone: String, email: String, address: String },
     items: Array,
     status: String,
@@ -84,6 +85,10 @@ const orderSchema = new mongoose.Schema({
 orderSchema.index({ idempotencyKey: 1 }, {
     unique: true,
     partialFilterExpression: { idempotencyKey: { $type: "string" } }
+});
+orderSchema.index({ publicReference: 1 }, {
+    unique: true,
+    partialFilterExpression: { publicReference: { $type: "string" } }
 });
 const Order = mongoose.model("Order", orderSchema);
 
@@ -190,6 +195,34 @@ async function seedLegacyCategories() {
 
 function publicCategory(category) {
     return { id: category.id, name: category.name, image: category.image || null };
+}
+
+function generatePublicOrderReference() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const random = randomBytes(5);
+    return `AC-${Array.from(random, byte => alphabet[byte & 31]).join("")}`;
+}
+
+function createOrderConfirmationToken(orderReference, secret, now = Date.now()) {
+    const payload = Buffer.from(JSON.stringify({ orderReference, expiresAt: now + 7 * 24 * 60 * 60 * 1000 })).toString("base64url");
+    const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+    return `${payload}.${signature}`;
+}
+
+function verifyOrderConfirmationToken(token, secret, now = Date.now()) {
+    if (typeof token !== "string" || token.length > 1024) return null;
+    const [payload, signature, extra] = token.split(".");
+    if (!payload || !signature || extra !== undefined) return null;
+    const expected = createHmac("sha256", secret).update(payload).digest();
+    let actual;
+    try { actual = Buffer.from(signature, "base64url"); } catch { return null; }
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+    try {
+        const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+        const validReference = /^AC-[A-HJ-NP-Z2-9]{5}$/.test(data.orderReference) || /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(data.orderReference);
+        if (!validReference || !Number.isFinite(data.expiresAt) || data.expiresAt <= now) return null;
+        return data.orderReference;
+    } catch { return null; }
 }
 
 function getWhatsAppConfig(env = process.env) {
@@ -318,7 +351,7 @@ function validateStorefrontOrigin(value, { production = false } = {}) {
 }
 
 function createApp({
-    sessionStore = new session.MemoryStore(),
+    sessionStore,
     sessionSecret = randomBytes(32).toString("hex"),
     adminUsername,
     adminPasswordHash,
@@ -330,6 +363,10 @@ function createApp({
     whatsappEnv = process.env,
     whatsappFetch = globalThis.fetch
 } = {}) {
+    if (production && (!sessionStore || sessionStore instanceof session.MemoryStore)) {
+        throw new Error("A persistent session store is required in production");
+    }
+    const configuredSessionStore = sessionStore || new session.MemoryStore();
     const app = express();
     const trustedStorefrontOrigin = validateStorefrontOrigin(storefrontOrigin, { production });
     if (production) app.set("trust proxy", 1);
@@ -341,7 +378,7 @@ function createApp({
     app.use(session({
         name: sessionCookieName,
         secret: sessionSecret,
-        store: sessionStore,
+        store: configuredSessionStore,
         resave: false,
         saveUninitialized: false,
         cookie: {
@@ -661,6 +698,22 @@ function createApp({
         res.json(product);
     });
 
+    // Confirmation tokens are short-lived, signed capabilities for one order's
+    // non-sensitive summary. They are sent in a header, never placed in URLs.
+    app.get("/api/order-confirmation", async (req, res) => {
+        const orderReference = verifyOrderConfirmationToken(req.get("X-Order-Confirmation"), sessionSecret);
+        if (!orderReference) return res.status(401).json({ error: "Order confirmation could not be verified" });
+        const query = orderReference.startsWith("AC-") ? { publicReference: orderReference } : { orderId: orderReference };
+        const order = await Order.findOne(query).select({ orderId: 1, publicReference: 1, status: 1, items: 1 }).lean();
+        if (!order) return res.status(404).json({ error: "Order confirmation is unavailable" });
+        const items = Array.isArray(order.items) ? order.items.map(item => ({
+            name: typeof item.name === "string" ? item.name : "Handmade item",
+            qty: Number.isSafeInteger(Number(item.qty)) && Number(item.qty) > 0 ? Number(item.qty) : 1,
+            price: Number.isFinite(Number(item.price)) ? Number(item.price) : null
+        })) : [];
+        res.json({ publicReference: order.publicReference || order.orderId, status: order.status || "Placed", items });
+    });
+
     app.post("/api/orders", async (req, res) => {
         const idempotencyKey = req.get?.("Idempotency-Key") || req.headers?.["idempotency-key"];
         if (idempotencyKey === undefined) {
@@ -676,11 +729,20 @@ function createApp({
             try { if (!getWhatsAppConfig(whatsappEnv)) initialNotificationStatus = "not_configured"; }
             catch { initialNotificationStatus = "not_configured"; }
             const newOrder = new Order({
-                ...req.body, orderId, status: "Placed",
+                ...req.body, orderId, publicReference: generatePublicOrderReference(), status: "Placed",
                 ...(idempotencyKey ? { idempotencyKey, requestHash } : {}),
                 whatsappNotificationStatus: initialNotificationStatus
             });
-            await newOrder.save();
+            let orderSaved = false;
+            for (let attempt = 0; attempt < 5 && !orderSaved; attempt++) {
+                try {
+                    await newOrder.save();
+                    orderSaved = true;
+                } catch (saveError) {
+                    if (saveError.code !== 11000 || !saveError.keyPattern?.publicReference || attempt === 4) throw saveError;
+                    newOrder.publicReference = generatePublicOrderReference();
+                }
+            }
             try {
                 if (initialNotificationStatus === "pending") {
                     await processOrderWhatsAppNotification(orderId, { env: whatsappEnv, fetchImpl: whatsappFetch });
@@ -688,14 +750,22 @@ function createApp({
             } catch {
                 console.error("WhatsApp notification processing failed; order remains saved for reconciliation");
             }
-            res.status(201).json({ orderId });
+            res.status(201).json({
+                orderId,
+                publicReference: newOrder.publicReference,
+                confirmationToken: createOrderConfirmationToken(newOrder.publicReference, sessionSecret)
+            });
         } catch (error) {
             if (error.code === 11000 && idempotencyKey) {
                 try {
                     const existing = await Order.findOne({ idempotencyKey }).select("+idempotencyKey +requestHash");
                     if (existing) {
                         if (existing.requestHash !== requestHash) return res.status(409).json({ error: "This checkout key was already used for a different order" });
-                        return res.status(200).json({ orderId: existing.orderId });
+                        return res.status(200).json({
+                            orderId: existing.orderId,
+                            publicReference: existing.publicReference || existing.orderId,
+                            confirmationToken: createOrderConfirmationToken(existing.publicReference || existing.orderId, sessionSecret)
+                        });
                     }
                 } catch {
                     // Fall through to a generic safe error if the idempotency lookup fails.
@@ -813,6 +883,18 @@ function createApp({
     return app;
 }
 
+function verifySessionStoreReady(store) {
+    return new Promise((resolve, reject) => {
+        if (!store || typeof store.get !== "function") {
+            reject(new Error("A valid session store is required before startup"));
+            return;
+        }
+        // connect-mongo initializes its collection and TTL index on first use.
+        // Probe with a non-existent ID so those failures happen before listen().
+        store.get("__startup_readiness_check__", error => error ? reject(error) : resolve());
+    });
+}
+
 function validateProductionConfig(env = process.env) {
     if (env.NODE_ENV !== "production") {
         throw new Error("NODE_ENV must be explicitly set to production for production startup");
@@ -830,10 +912,10 @@ function validateProductionConfig(env = process.env) {
     validateStorefrontOrigin(env.STOREFRONT_ORIGIN, { production: true });
 }
 
-// Export a memory-backed app for isolated unit tests only. Production startup below
-// creates a separate app with a MongoDB-backed session store and validated secrets.
+// Unit tests import a memory-backed app. Production creates only the MongoDB-backed
+// app below; never instantiate an unused MemoryStore app in the production process.
 configureCloudinary();
-const app = createApp();
+const app = process.env.NODE_ENV === "production" ? null : createApp();
 
 async function startServer() {
     validateProductionConfig();
@@ -849,6 +931,7 @@ async function startServer() {
         ttl: sessionMaxAgeMs / 1000,
         autoRemove: "native"
     });
+    await verifySessionStoreReady(store);
     const productionApp = createApp({
         sessionStore: store,
         sessionSecret: process.env.SESSION_SECRET,
@@ -868,4 +951,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady };

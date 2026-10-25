@@ -1,37 +1,42 @@
-<nav class="navbar">
-
+<nav class="navbar" aria-label="Main navigation">
     <div class="nav-left">
-
-        <button class="back-btn" onclick="history.back()">
-            ← Back
-        </button>
-
+        <button class="back-btn" type="button" onclick="history.back()" aria-label="Go back">← Back</button>
         <a href="index.html" class="logo" aria-label="Art Corner Bengaluru home">
             <img src="images/art-corner-logo-transparent.png" alt="Art Corner Bengaluru">
         </a>
-
     </div>
 
-    <div class="nav-right">
-
-        <a href="index.html">🏠 Home</a>
-
-        <a href="products.html">🛍️ Products</a>
-
-        <a href="cart.html">🛒 Cart</a>
-
-        <a href="login.html" id="loginLink">
-            👤 Login
-        </a>
-
-        <a href="dashboard.html" id="dashboardLink">
-            ⚙️ Dashboard
-        </a>
-
-        <a href="#" id="logoutLink">
-            🚪 Logout
-        </a>
-
+    <div class="nav-right desktop-nav-links">
+        <a href="index.html">Home</a>
+        <a href="products.html">Products</a>
+        <a href="cart.html" class="nav-cart-link" aria-label="Cart, 0 items">Cart <span class="cart-badge" data-cart-count aria-hidden="true" hidden>0</span></a>
+        <a href="login.html" data-nav-login>Account</a>
+        <a href="dashboard.html" data-nav-dashboard hidden>Dashboard</a>
+        <a href="#" data-nav-logout hidden>Logout</a>
     </div>
 
+    <div class="nav-actions">
+        <a href="cart.html" class="mobile-cart-link" aria-label="Cart, 0 items">
+            <span aria-hidden="true">🛒</span><span class="cart-badge" data-cart-count aria-hidden="true" hidden>0</span>
+        </a>
+        <button id="mobileMenuToggle" class="menu-toggle" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mobileMenu">
+            <span aria-hidden="true">☰</span>
+        </button>
+    </div>
 </nav>
+
+<button id="mobileMenuBackdrop" class="mobile-menu-backdrop" type="button" aria-label="Close navigation menu" tabindex="-1" hidden></button>
+<aside id="mobileMenu" class="mobile-menu" role="dialog" aria-modal="true" aria-labelledby="mobileMenuTitle" aria-hidden="true" inert>
+    <div class="mobile-menu-heading">
+        <h2 id="mobileMenuTitle">Menu</h2>
+        <button id="mobileMenuClose" class="mobile-menu-close" type="button" aria-label="Close menu">×</button>
+    </div>
+    <nav class="mobile-menu-links" aria-label="Mobile navigation">
+        <a href="index.html">Home</a>
+        <a href="products.html">Products</a>
+        <a href="cart.html">Cart <span class="cart-badge" data-cart-count aria-hidden="true" hidden>0</span></a>
+        <a href="login.html" data-nav-login>Account</a>
+        <a href="dashboard.html" data-nav-dashboard hidden>Dashboard</a>
+        <a href="#" data-nav-logout hidden>Logout</a>
+    </nav>
+</aside>

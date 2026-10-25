@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Order confirmed | Art Corner Bengaluru</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <div id="navbar-container"></div>
+    <main class="page-container order-success-page">
+        <section id="orderSuccessCard" class="order-success-card" aria-live="polite" aria-busy="true">
+            <div class="order-success-mark" aria-hidden="true">✓</div>
+            <p class="home-eyebrow">MADE WITH CARE</p>
+            <h1 id="orderSuccessHeading">Checking your order…</h1>
+            <p id="orderSuccessMessage" role="status">Please wait while we verify your confirmation.</p>
+            <div id="orderSuccessDetails" class="order-success-details" hidden></div>
+            <div class="order-success-actions">
+                <a class="primary-link-button" href="products.html">Continue Shopping</a>
+                <a class="secondary-link-button" href="index.html">Back to Home</a>
+            </div>
+        </section>
+    </main>
+    <div id="footer-container"></div>
+    <div class="bottom-nav">
+        <a href="index.html" aria-label="Home">🏠</a>
+        <a href="products.html" aria-label="Products">🛍️</a>
+        <a href="cart.html" aria-label="Cart">🛒</a>
+        <a href="login.html" aria-label="Account">👤</a>
+    </div>
+    <script src="js/common.js"></script>
+    <script src="order-success.js"></script>
+</body>
+</html>

@@ -11,21 +11,27 @@
 
     <div id="navbar-container"></div>
 
-    <div class="page-container">
-
-        <h1>Your Cart</h1>
-
-        <div id="cart"></div>
-
-        <h2 id="total"></h2>
-
-        <div style="text-align:center; margin-top:20px;">
-            <a href="checkout.html">
-                <button>Proceed to Checkout</button>
-            </a>
+    <main class="page-container cart-page">
+        <div class="cart-page-heading">
+            <div>
+                <p class="home-eyebrow">YOUR HANDMADE FINDS</p>
+                <h1>Your Cart</h1>
+            </div>
+            <a class="text-link" href="products.html">← Continue shopping</a>
         </div>
-
-    </div>
+        <p id="cartStatus" class="cart-status" role="status" aria-live="polite"></p>
+        <div class="cart-layout">
+            <section id="cart" class="cart-items" aria-label="Items in your cart"></section>
+            <aside class="cart-summary" aria-labelledby="cartSummaryTitle">
+                <h2 id="cartSummaryTitle">Order summary</h2>
+                <p><span>Subtotal</span><strong id="subtotal">₹0</strong></p>
+                <p class="cart-total-line"><span>Total</span><strong id="total">₹0</strong></p>
+                <p class="cart-shipping-note">Shipping and payment details will be confirmed by the store.</p>
+                <a id="checkoutLink" class="primary-link-button" href="checkout.html">Proceed to Checkout</a>
+                <a class="secondary-link-button" href="products.html">Continue Shopping</a>
+            </aside>
+        </div>
+    </main>
 
     <div id="footer-container"></div>
 
