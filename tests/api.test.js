@@ -1436,7 +1436,7 @@ test("admin order table treats public checkout fields as text, not markup", asyn
   await runBrowserScript("public/orders.js", {
     nodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
     fetchImpl: async () => ({ ok: true, json: async () => [{
-      orderId: payload, customer: { name: payload, phone: '" autofocus onfocus="alert(1)' },
+      orderId: payload, publicReference: payload, customer: { name: payload, phone: '" autofocus onfocus="alert(1)' },
       items: [{ name: payload, qty: 1 }], status: payload, whatsappNotificationStatus: payload
     }] })
   });
@@ -1449,6 +1449,31 @@ test("admin order table treats public checkout fields as text, not markup", asyn
   assert.equal(row.children[6].textContent, payload);
   assert.equal(row.innerHTML, "");
   assert.equal(row.children.some(cell => cell.children.some(child => child.tagName === "img" || child.tagName === "svg")), false);
+});
+test("admin orders display the public reference and keep internal IDs for order actions", async () => {
+  const tbody = uiElement("tbody");
+  const nodes = { notificationFeedback: uiElement("p"), search: uiElement("input"), filter: uiElement("select") };
+  const orders = [
+    { orderId: "ORD-internal-123", publicReference: "AC-FHS7L", status: "Placed", whatsappNotificationStatus: "failed" },
+    { orderId: "ORD-legacy-456", status: "Placed", whatsappNotificationStatus: "sent" }
+  ];
+  const requests = [];
+  await runBrowserScript("public/orders.js", {
+    nodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
+    fetchImpl: async (url, options = {}) => {
+      requests.push({ url, method: options.method || "GET" });
+      return { ok: true, json: async () => url === "/api/orders" ? orders : {} };
+    }
+  });
+
+  assert.equal(tbody.children[0].children[0].textContent, "AC-FHS7L");
+  assert.equal(tbody.children[1].children[0].textContent, "Legacy: ORD-legacy-456");
+  const statusSelect = tbody.children[0].children[5].children[0];
+  statusSelect.value = "Shipped";
+  await statusSelect.handlers.change();
+  await tbody.children[0].children[6].children[0].handlers.click();
+  assert.ok(requests.some(request => request.url === "/api/orders/ORD-internal-123" && request.method === "PUT"));
+  assert.ok(requests.some(request => request.url === "/api/admin/orders/ORD-internal-123/whatsapp-notification/retry" && request.method === "POST"));
 });
 test("category management page lists and creates categories", async () => {
   const nodes = {

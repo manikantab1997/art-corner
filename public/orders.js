@@ -28,7 +28,10 @@ function renderOrders(orders) {
       cell.textContent = value == null ? "" : String(value);
       return cell;
     };
-    tr.appendChild(makeCell(order.orderId || ""));
+    const displayedReference = typeof order.publicReference === "string" && order.publicReference
+      ? order.publicReference
+      : order.orderId ? `Legacy: ${order.orderId}` : "Reference unavailable";
+    tr.appendChild(makeCell(displayedReference));
     tr.appendChild(makeCell(order.customer?.name || ""));
     tr.appendChild(makeCell(order.customer?.phone || ""));
 
@@ -131,6 +134,7 @@ function filterOrders() {
   const query = document.getElementById("search").value.toLowerCase();
   const status = document.getElementById("filter").value;
   renderOrders(allOrders.filter(order =>
+    String(order.publicReference || "").toLowerCase().includes(query) ||
     String(order.orderId || "").toLowerCase().includes(query) ||
     String(order.customer?.name || "").toLowerCase().includes(query)
   ).filter(order => status === "all" || order.status === status));
