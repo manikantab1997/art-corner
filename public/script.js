@@ -42,18 +42,44 @@ function getProductImageSource(product) {
   return "";
 }
 
-function renderHeroCollage(products) {
+function renderHeroCollage(products, categories = [], emptyMessage = "Handmade details, thoughtfully chosen.") {
   heroCollage.replaceChildren(heroCollageStatus);
+  heroCollage.classList.remove("hero-product-collage-empty");
+  heroCollage.classList.remove("hero-collage-count-1");
+  heroCollage.classList.remove("hero-collage-count-2");
+  heroCollage.classList.remove("hero-collage-count-3");
   heroCollageStatus.hidden = false;
-  const featured = products
+  const imageProducts = products
     .map(product => ({ product, imageSource: getSavedProductImageSource(product?.image) }))
-    .filter(item => item.imageSource)
-    .slice(0, 3);
+    .filter(item => item.imageSource);
+  const featured = [];
+  const selectedProducts = new Set();
+
+  if (Array.isArray(categories)) {
+    categories.forEach(category => {
+      if (!category || !Number.isInteger(Number(category.id))) return;
+      const representative = imageProducts.find(item =>
+        !selectedProducts.has(item.product) && String(item.product.categoryId) === String(category.id)
+      );
+      if (representative && featured.length < 3) {
+        featured.push(representative);
+        selectedProducts.add(representative.product);
+      }
+    });
+  }
+  imageProducts.forEach(item => {
+    if (featured.length < 3 && !selectedProducts.has(item.product)) {
+      featured.push(item);
+      selectedProducts.add(item.product);
+    }
+  });
 
   if (!featured.length) {
-    heroCollageStatus.textContent = "Product photos will appear here when available.";
+    heroCollage.classList.add("hero-product-collage-empty");
+    heroCollageStatus.textContent = emptyMessage;
     return;
   }
+  heroCollage.classList.add(`hero-collage-count-${featured.length}`);
 
   let pendingImages = featured.length;
   let visibleImages = 0;
@@ -62,22 +88,30 @@ function renderHeroCollage(products) {
     tile.className = "hero-collage-tile";
     tile.href = `product.html?id=${encodeURIComponent(product._id)}`;
     tile.setAttribute("aria-label", `View ${product.name || "handmade product"}`);
-    tile.hidden = true;
 
     const image = document.createElement("img");
     image.alt = product.name || "Handmade product";
     image.loading = index === 0 ? "eager" : "lazy";
     image.decoding = "async";
+    image.hidden = true;
     image.addEventListener("load", () => {
-      tile.hidden = false;
+      image.hidden = false;
       visibleImages += 1;
       pendingImages -= 1;
       heroCollageStatus.hidden = true;
     });
     image.addEventListener("error", () => {
-      tile.remove();
+      image.remove();
+      tile.classList.add("hero-collage-tile-unavailable");
+      tile.setAttribute("aria-label", `View ${product.name || "handmade product"}; photo unavailable`);
+      caption.textContent = `${product.name || "Handmade product"} · Photo unavailable`;
       pendingImages -= 1;
       if (pendingImages === 0 && visibleImages === 0) {
+        heroCollage.replaceChildren(heroCollageStatus);
+        heroCollage.classList.remove("hero-collage-count-1");
+        heroCollage.classList.remove("hero-collage-count-2");
+        heroCollage.classList.remove("hero-collage-count-3");
+        heroCollage.classList.add("hero-product-collage-empty");
         heroCollageStatus.hidden = false;
         heroCollageStatus.textContent = "Product photos are temporarily unavailable.";
       }
@@ -235,9 +269,10 @@ async function loadHomePage() {
 
   if (productResult.status === "fulfilled") {
     renderFeaturedProducts(products);
-    renderHeroCollage(products);
+    renderHeroCollage(products, categoryResult.status === "fulfilled" ? categoryResult.value : []);
   } else {
     console.error("Featured product request failed:", productResult.reason);
+    renderHeroCollage([], [], "Product photos are temporarily unavailable.");
     productsStatus.textContent = "Products are temporarily unavailable. Please try again shortly.";
   }
 
