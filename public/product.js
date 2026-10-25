@@ -5,8 +5,52 @@ const productContainer = document.getElementById("product");
 const addButton = document.getElementById("addToCart");
 let currentProduct = null;
 addButton.disabled = true;
+
+function safeProductImageUrl(value) {
+  if (typeof value !== "string") return "";
+  const source = value.trim();
+  if (!source || /[\u0000-\u001f\u007f<>"'`]/.test(source)) return "";
+  if (source.startsWith("/")) {
+    if (source.startsWith("//") || source.includes("\\") || source.split(/[?#]/, 1)[0].split("/").includes("..")) return "";
+    try { return new URL(source, "https://art-corner.invalid").origin === "https://art-corner.invalid" ? source : ""; }
+    catch { return ""; }
+  }
+  try {
+    const url = new URL(source);
+    return url.protocol === "https:" && url.hostname && !url.username && !url.password ? url.href : "";
+  } catch { return ""; }
+}
+
+function renderProduct(product) {
+  productContainer.replaceChildren();
+  const imageUrl = safeProductImageUrl(product.image);
+  if (imageUrl) {
+    const image = document.createElement("img");
+    image.src = imageUrl;
+    image.alt = typeof product.name === "string" ? product.name : "Handmade product";
+    image.loading = "lazy";
+    productContainer.appendChild(image);
+  }
+  const title = document.createElement("h2");
+  title.textContent = typeof product.name === "string" ? product.name : "Handmade product";
+  const price = document.createElement("p");
+  price.textContent = `₹${Number.isFinite(Number(product.price)) ? Number(product.price) : "Price unavailable"}`;
+  const availability = document.createElement("p");
+  availability.className = product.inStock ? "product-available" : "product-unavailable";
+  availability.textContent = product.inStock ? "Available" : "Out of Stock";
+  productContainer.append(title, price, availability);
+}
+
+function renderProductError(message) {
+  productContainer.replaceChildren();
+  const error = document.createElement("p");
+  error.setAttribute("role", "alert");
+  error.textContent = message;
+  productContainer.appendChild(error);
+}
+
 if (!productId) {
-  productContainer.innerHTML = "<p role=\"alert\">This product link is missing its ID. Return to the product list and choose an item.</p>";
+  renderProductError("This product link is missing its ID. Return to the product list and choose an item.");
 } else {
   productContainer.innerHTML = "<p role=\"status\">Loading product…</p>";
   fetch(`/api/product/${encodeURIComponent(productId)}`)
@@ -17,7 +61,7 @@ if (!productId) {
     })
     .then(product => {
       currentProduct = product;
-      productContainer.innerHTML = `<img src="${product.image}" alt="${product.name}" /><h2>${product.name}</h2><p>₹${product.price}</p><p style="color:${product.inStock ? 'green' : 'red'}">${product.inStock ? 'Available' : 'Out of Stock'}</p>`;
+      renderProduct(product);
       if (product.customizationEnabled === true) {
         const enquiry = document.createElement("section");
         enquiry.className = "product-customization";
@@ -52,7 +96,7 @@ if (!productId) {
     })
     .catch(error => {
       console.error("Product detail request failed:", error);
-      productContainer.innerHTML = `<p role="alert">${error.message || "Product could not be loaded. Please try again."}</p>`;
+      renderProductError(error.message || "Product could not be loaded. Please try again.");
     });
 }
 addButton.onclick = () => {

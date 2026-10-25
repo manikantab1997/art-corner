@@ -23,10 +23,40 @@ function renderOrders(orders) {
   }
   orders.forEach(order => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${order.orderId || ""}</td><td>${order.customer?.name || ""}</td><td>${order.customer?.phone || ""}</td><td>${(order.items || []).map(item => `${item.name || "Item"} (x${item.qty || 0})`).join("<br>")}</td><td>${order.status || ""}</td><td><select aria-label="Status for ${order.orderId}"><option ${order.status === "Placed" ? "selected" : ""}>Placed</option><option ${order.status === "Shipped" ? "selected" : ""}>Shipped</option><option ${order.status === "Delivered" ? "selected" : ""}>Delivered</option></select></td><td>${order.whatsappNotificationStatus || "not_configured"}</td>`;
-    const select = tr.querySelector("select");
+    const makeCell = value => {
+      const cell = document.createElement("td");
+      cell.textContent = value == null ? "" : String(value);
+      return cell;
+    };
+    tr.appendChild(makeCell(order.orderId || ""));
+    tr.appendChild(makeCell(order.customer?.name || ""));
+    tr.appendChild(makeCell(order.customer?.phone || ""));
+
+    const itemsCell = document.createElement("td");
+    (Array.isArray(order.items) ? order.items : []).forEach(item => {
+      const line = document.createElement("div");
+      line.textContent = `${item?.name || "Item"} (x${item?.qty || 0})`;
+      itemsCell.appendChild(line);
+    });
+    tr.appendChild(itemsCell);
+    tr.appendChild(makeCell(order.status || ""));
+
+    const statusCell = document.createElement("td");
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "Order status");
+    ["Placed", "Shipped", "Delivered"].forEach(status => {
+      const option = document.createElement("option");
+      option.value = status;
+      option.textContent = status;
+      select.appendChild(option);
+    });
+    if (["Placed", "Shipped", "Delivered"].includes(order.status)) select.value = order.status;
+    statusCell.appendChild(select);
+    tr.appendChild(statusCell);
     select.addEventListener("change", () => updateStatus(order.orderId, select.value));
-    const noticeCell = tr.children[6];
+    const notificationStatus = order.whatsappNotificationStatus || "not_configured";
+    const noticeCell = makeCell(notificationStatus);
+    tr.appendChild(noticeCell);
     if (["pending", "failed", "not_configured"].includes(order.whatsappNotificationStatus)) {
       const retry = document.createElement("button");
       retry.type = "button";

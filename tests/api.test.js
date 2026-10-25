@@ -319,7 +319,7 @@ function uiElement(tagName = "div") {
     get innerHTML() { return this._innerHTML || ""; },
     appendChild(child) { this.children.push(child); return child; },
     append(...children) { this.children.push(...children); },
-    replaceChildren(...children) { this.children = children; },
+    replaceChildren(...children) { this.children = children; this._innerHTML = ""; },
     addEventListener(type, handler) { this.handlers[type] = handler; },
     setAttribute(name, value) { this.attributes[name] = value; },
     reset() { this.resetCalled = true; },
@@ -328,19 +328,20 @@ function uiElement(tagName = "div") {
     querySelector(selector) { return this.children.find(child => child.className === selector.slice(1)) || null; }
   };
 }
-async function runBrowserScript(relativePath, { nodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, stored = {} } = {}) {
+async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, stored = {} } = {}) {
   const storage = new Map(Object.entries(stored));
   const localStorage = { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) };
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" }, addEventListener() {}, dispatchEvent() {} };
   const document = {
     getElementById: id => nodes[id] || null,
+    querySelector: selector => queryNodes[selector] || null,
     createElement: tag => uiElement(tag),
     createTextNode: text => Object.assign(uiElement("#text"), { textContent: text })
   };
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
     document, window: { ...window, confirm: confirmImpl }, localStorage, fetch: fetchImpl, console, URLSearchParams,
-    URL, encodeURIComponent, requireAdminPage, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
+    URL, encodeURIComponent, requireAdminPage, confirm: confirmImpl, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
     FormData: class { append() {} }, alert() {}
   });
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -670,6 +671,14 @@ test("checkout rejects invalid customer details without sending or clearing the 
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.emailError.textContent, /valid email/i);
   assert.match(browser.nodes.checkoutFeedback.textContent, /highlighted details/i);
+});
+test("checkout summary renders attacker-controlled cart names as text", () => {
+  const payload = '<svg onload="alert(1)">';
+  const browser = checkoutBrowser({ cart: [{ _id: "p1", name: payload, price: 25, qty: 1 }] });
+  const row = browser.nodes.checkoutSummaryItems.children[0];
+  assert.equal(row.children[0].textContent, `${payload} · 1`);
+  assert.equal(row.innerHTML, "");
+  assert.equal(row.children.some(child => child.tagName === "svg"), false);
 });
 test("legacy confirmation URL is not accepted as proof and does not submit checkout", () => {
   const orderId = "ORD-123e4567-e89b-42d3-a456-426614174000";
@@ -1330,6 +1339,90 @@ test("product page uses fetched category names and still renders products if cat
   assert.equal(failedNodes.categoryFilter.value, "");
   assert.equal(failedBrowser.window.history.replacedUrl, "products.html");
 });
+test("public product listing renders hostile names as text and rejects unsafe image URLs", async () => {
+  const payload = '<img src=x onerror="alert(1)">';
+  const nodes = { categoryFilter: uiElement("select"), pageTitle: uiElement("h1"), products: uiElement(), search: uiElement("input"), categoryFeedback: uiElement("p") };
+  await runBrowserScript("public/products.js", {
+    nodes,
+    fetchImpl: async url => url === "/api/categories"
+      ? { ok: true, json: async () => [] }
+      : { ok: true, json: async () => [
+        { _id: "p1", name: payload, image: 'https://res.cloudinary.com/demo/image/upload/a.jpg" onerror="alert(1)', price: 100, inStock: true },
+        { _id: "p2", name: "Safe Cloudinary image", image: "https://res.cloudinary.com/demo/image/upload/b.jpg", price: 200, inStock: true },
+        { _id: "p3", name: "Unsafe scheme", image: "javascript:alert(1)", price: 300, inStock: true },
+        { _id: "p4", name: "Protocol relative", image: "//evil.example/image.jpg", price: 400, inStock: true },
+        { _id: "p5", name: "Malformed URL", image: "https://[", price: 500, inStock: true }
+      ] }
+  });
+  assert.equal(nodes.products.children.length, 5);
+  assert.equal(nodes.products.children[0].children[0].textContent, payload);
+  assert.equal(nodes.products.children[0].children.some(child => child.tagName === "img"), false);
+  assert.equal(nodes.products.children[1].children[0].src, "https://res.cloudinary.com/demo/image/upload/b.jpg");
+  assert.equal(nodes.products.children.slice(2).every(card => !card.children.some(child => child.tagName === "img")), true);
+  assert.equal(nodes.products.children.every(card => card.innerHTML === ""), true);
+});
+test("product details safely render database fields and reject unsafe image URLs", async () => {
+  const payload = '<svg onload="alert(1)">product</svg>';
+  const nodes = { product: uiElement(), addToCart: uiElement("button") };
+  await runBrowserScript("public/product.js", {
+    nodes, search: "?id=p1",
+    fetchImpl: async () => ({ ok: true, json: async () => ({ _id: "p1", name: payload, image: "data:text/html,<script>alert(1)</script>", price: 50, inStock: true }) })
+  });
+  assert.equal(nodes.product.children.find(child => child.tagName === "h2").textContent, payload);
+  assert.equal(nodes.product.children.some(child => child.tagName === "img"), false);
+  assert.equal(nodes.product.innerHTML, "");
+
+  const safeNodes = { product: uiElement(), addToCart: uiElement("button") };
+  await runBrowserScript("public/product.js", {
+    nodes: safeNodes, search: "?id=p2",
+    fetchImpl: async () => ({ ok: true, json: async () => ({ _id: "p2", name: "Legacy", image: "/uploads/candle.jpg", price: 50, inStock: true }) })
+  });
+  assert.equal(safeNodes.product.children[0].src, "/uploads/candle.jpg");
+});
+test("admin product list renders hostile product data safely and uses event listeners", async () => {
+  const payload = '<img src=x onerror="alert(1)">';
+  const nodes = { products: uiElement(), category: uiElement("select"), categoryFeedback: uiElement("p") };
+  const requests = [];
+  await runBrowserScript("public/admin.js", {
+    nodes, requireAdminPage: async () => true,
+    fetchImpl: async url => {
+      requests.push(url);
+      if (url === "/api/categories") return { ok: true, json: async () => [] };
+      if (url === "/api/admin/products") return { ok: true, json: async () => [{
+        _id: "bad-id';alert(1);//", name: payload, image: "javascript:alert(1)", price: 12, inStock: true
+      }] };
+      return { ok: true, json: async () => ({}) };
+    }
+  });
+  const card = nodes.products.children[0];
+  assert.equal(card.children.find(child => child.tagName === "h3").textContent, payload);
+  assert.equal(card.children.some(child => child.tagName === "img"), false);
+  assert.equal(card.innerHTML, "");
+  const actionButtons = card.children.filter(child => child.tagName === "button");
+  assert.deepEqual(actionButtons.map(button => button.textContent), ["Delete", "Toggle Stock"]);
+  assert.ok(actionButtons.every(button => typeof button.handlers.click === "function" && !button.attributes.onclick));
+});
+test("admin order table treats public checkout fields as text, not markup", async () => {
+  const payload = '<img src=x onerror="alert(1)">';
+  const tbody = uiElement("tbody");
+  const nodes = { notificationFeedback: uiElement("p"), search: uiElement("input"), filter: uiElement("select") };
+  await runBrowserScript("public/orders.js", {
+    nodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
+    fetchImpl: async () => ({ ok: true, json: async () => [{
+      orderId: payload, customer: { name: payload, phone: '" autofocus onfocus="alert(1)' },
+      items: [{ name: payload, qty: 1 }], status: payload, whatsappNotificationStatus: payload
+    }] })
+  });
+  assert.equal(tbody.children.length, 1);
+  const row = tbody.children[0];
+  assert.deepEqual(row.children.slice(0, 3).map(cell => cell.textContent), [payload, payload, '" autofocus onfocus="alert(1)']);
+  assert.equal(row.children[3].children[0].textContent, `${payload} (x1)`);
+  assert.equal(row.children[4].textContent, payload);
+  assert.equal(row.children[5].children[0].attributes["aria-label"], "Order status");
+  assert.equal(row.children[6].textContent, payload);
+  assert.equal(row.innerHTML, "");
+  assert.equal(row.children.some(cell => cell.children.some(child => child.tagName === "img" || child.tagName === "svg")), false);
+});
 test("category management page lists and creates categories", async () => {
   const nodes = {
     categoriesList: uiElement(), categoryFeedback: uiElement("p"), createCategoryForm: uiElement("form"),
@@ -1514,7 +1607,7 @@ test("admin UI continues to load the protected product-list API", async () => {
   });
   assert.ok(requested.includes("/api/admin/products"));
   assert.equal(nodes.products.children.length, 1);
-  assert.match(nodes.products.children[0].innerHTML, /Out of Stock/);
+  assert.equal(nodes.products.children[0].children.find(child => child.tagName === "p" && child.textContent === "Out of Stock").textContent, "Out of Stock");
   const source = fs.readFileSync(path.join(__dirname, "../public/admin.html"), "utf8");
   assert.match(source, /id="customizationEnabled"/);
   const checkbox = nodes.products.children[0].children.find(child => child.className === "admin-product-customization").children[0];

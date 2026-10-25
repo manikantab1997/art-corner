@@ -9,6 +9,21 @@ const categoryFeedback = document.getElementById("categoryFeedback");
 productContainer.innerHTML = "<p role=\"status\">Loading products…</p>";
 const categoriesById = new Map();
 let selectedCategoryId = categoryId;
+
+function safeProductImageUrl(value) {
+  if (typeof value !== "string") return "";
+  const source = value.trim();
+  if (!source || /[\u0000-\u001f\u007f<>"'`]/.test(source)) return "";
+  if (source.startsWith("/")) {
+    if (source.startsWith("//") || source.includes("\\") || source.split(/[?#]/, 1)[0].split("/").includes("..")) return "";
+    try { return new URL(source, "https://art-corner.invalid").origin === "https://art-corner.invalid" ? source : ""; }
+    catch { return ""; }
+  }
+  try {
+    const url = new URL(source);
+    return url.protocol === "https:" && url.hostname && !url.username && !url.password ? url.href : "";
+  } catch { return ""; }
+}
 if (categoryFilter) {
   categoryFilter.addEventListener("change", () => {
     const query = categoryFilter.value ? `?category=${encodeURIComponent(categoryFilter.value)}` : "";
@@ -78,7 +93,19 @@ function renderProducts(products) {
     card.className = "card";
     card.tabIndex = 0;
     card.setAttribute("role", "link");
-    card.innerHTML = `<img src="${product.image}" alt="${product.name}" /><h3>${product.name}</h3><p>₹${product.price}</p>`;
+    const imageUrl = safeProductImageUrl(product.image);
+    if (imageUrl) {
+      const image = document.createElement("img");
+      image.src = imageUrl;
+      image.alt = typeof product.name === "string" ? product.name : "Handmade product";
+      image.loading = "lazy";
+      card.appendChild(image);
+    }
+    const title = document.createElement("h3");
+    title.textContent = typeof product.name === "string" ? product.name : "Handmade product";
+    const price = document.createElement("p");
+    price.textContent = `₹${Number.isFinite(Number(product.price)) ? Number(product.price) : "Price unavailable"}`;
+    card.append(title, price);
     const openProduct = () => { window.location.href = `product.html?id=${encodeURIComponent(product._id)}`; };
     card.addEventListener("click", openProduct);
     card.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openProduct(); } });
