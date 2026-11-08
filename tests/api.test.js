@@ -360,11 +360,13 @@ function uiElement(tagName = "div") {
     replaceChildren(...children) { this.children = children; this._innerHTML = ""; },
     addEventListener(type, handler) { this.handlers[type] = handler; },
     setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] ?? null; },
     removeAttribute(name) { delete this.attributes[name]; if (name === "src") this.src = ""; },
     reset() { this.resetCalled = true; },
     focus() { this.focused = true; },
     remove() { this.removed = true; },
-    querySelector(selector) { return this.children.find(child => child.className === selector.slice(1)) || null; }
+    querySelector(selector) { return this.children.find(child => child.className === selector.slice(1)) || null; },
+    querySelectorAll() { return this.children.flatMap(child => [child, ...(child.querySelectorAll ? child.querySelectorAll("") : [])]); }
   };
 }
 async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, stored = {} } = {}) {
@@ -375,7 +377,11 @@ async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fet
     getElementById: id => nodes[id] || null,
     querySelector: selector => queryNodes[selector] || null,
     createElement: tag => uiElement(tag),
-    createTextNode: text => Object.assign(uiElement("#text"), { textContent: text })
+    createTextNode: text => Object.assign(uiElement("#text"), { textContent: text }),
+    body: uiElement("body"),
+    activeElement: null,
+    handlers: {},
+    addEventListener(type, handler) { this.handlers[type] = handler; }
   };
   const source = fs.readFileSync(path.join(__dirname, "..", relativePath), "utf8");
   vm.runInNewContext(source, {
@@ -384,7 +390,7 @@ async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fet
     FormData: class { append() {} }, alert() {}
   });
   await new Promise(resolve => setTimeout(resolve, 0));
-  return { window, nodes, storage };
+  return { window, nodes, storage, document };
 }
 
 test("GET /api/products queries only in-stock products", async () => {
@@ -2270,52 +2276,143 @@ test("admin product list renders hostile product data safely and uses event list
   assert.deepEqual(actionButtons.map(button => button.textContent), ["Delete", "Toggle Stock"]);
   assert.ok(actionButtons.every(button => typeof button.handlers.click === "function" && !button.attributes.onclick));
 });
-test("admin order table treats public checkout fields as text, not markup", async () => {
+function makeOrdersPageNodes() {
+  const nodes = Object.fromEntries([
+    "ordersCards", "search", "filter", "dateFilter", "ordersCount", "notificationFeedback", "detailFeedback",
+    "orderDetailsView", "orderDetailsContent", "orderDetailsTitle", "closeOrderDetails"
+  ].map(id => [id, uiElement(id === "search" ? "input" : id.includes("Filter") || id === "filter" ? "select" : "div")]));
+  nodes.orderDetailsView.hidden = true;
+  return nodes;
+}
+function flattenUi(root) {
+  return [root, ...(root.children || []).flatMap(flattenUi)];
+}
+
+test("admin order list and details safely render order data and reject unsafe product image URLs", async () => {
   const payload = '<img src=x onerror="alert(1)">';
   const tbody = uiElement("tbody");
-  const nodes = { notificationFeedback: uiElement("p"), search: uiElement("input"), filter: uiElement("select") };
+  const nodes = makeOrdersPageNodes();
+  const order = {
+    orderId: "ORD-safe-123", publicReference: payload, createdAt: "2026-11-08T09:00:00.000Z", total: 99, currency: "INR",
+    customer: { name: payload, phone: '" autofocus onfocus="alert(1)', email: "customer@example.test", address: payload },
+    items: [
+      { name: payload, qty: 1, price: 99, lineTotal: 99, image: "javascript:alert(1)" },
+      { name: "Legacy image", qty: 1, price: 20, lineTotal: 20, image: "/uploads/candle.jpg" }
+    ],
+    status: "Placed", paymentStatus: "Pending", paymentAmount: 99, whatsappNotificationStatus: "not_configured"
+  };
   await runBrowserScript("public/orders.js", {
     nodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
-    fetchImpl: async () => ({ ok: true, json: async () => [{
-      orderId: payload, publicReference: payload, customer: { name: payload, phone: '" autofocus onfocus="alert(1)' },
-      items: [{ name: payload, qty: 1 }], status: payload, whatsappNotificationStatus: payload
-    }] })
+    fetchImpl: async () => ({ ok: true, json: async () => [order] })
   });
   assert.equal(tbody.children.length, 1);
-  const row = tbody.children[0];
-  assert.deepEqual(row.children.slice(0, 3).map(cell => cell.textContent), [payload, payload, '" autofocus onfocus="alert(1)']);
-  assert.equal(row.children[3].children[0].textContent, `${payload} (x1)`);
-  assert.equal(row.children[4].textContent, "Legacy — payment state unavailable");
-  assert.equal(row.children[5].textContent, payload);
-  assert.equal(row.children[6].children[0].attributes["aria-label"], `Fulfilment status for ${payload}`);
-  assert.equal(row.children[7].textContent, payload);
-  assert.equal(row.innerHTML, "");
-  assert.equal(row.children.some(cell => cell.children.some(child => child.tagName === "img" || child.tagName === "svg")), false);
+  assert.equal(tbody.children[0].children[0].textContent, payload);
+  assert.equal(tbody.children[0].children[1].textContent, payload);
+  assert.equal(tbody.children[0].children[5].children[0].textContent, "Pending");
+  assert.equal(tbody.children[0].children[6].children[0].textContent, "Placed");
+  assert.equal(tbody.children[0].innerHTML, "");
+  await tbody.children[0].handlers.click({ key: "Enter", preventDefault() {} });
+  assert.equal(nodes.orderDetailsView.hidden, false);
+  const detailNodes = flattenUi(nodes.orderDetailsContent);
+  assert.ok(detailNodes.some(node => node.tagName === "strong" && node.textContent === payload));
+  const quantity = detailNodes.find(node => node.className === "order-product-quantity");
+  assert.equal(quantity.textContent, "1", "quantity content stays plain so responsive CSS adds the label only once");
+  assert.equal(detailNodes.filter(node => node.tagName === "img").length, 1);
+  assert.equal(detailNodes.find(node => node.tagName === "img").src, "/uploads/candle.jpg");
+  assert.ok(detailNodes.every(node => !node.innerHTML));
+  assert.equal(detailNodes.some(node => node.attributes.onclick), false);
 });
-test("admin orders display the public reference and keep internal IDs for order actions", async () => {
+
+test("admin orders responsive styles keep table scrolling contained and switch to cards at 430px", () => {
+  const css = fs.readFileSync(path.join(__dirname, "../public/style.css"), "utf8");
+  assert.match(css, /\.orders-table-scroll\s*\{[^}]*overflow-x:\s*auto/s);
+  assert.match(css, /\.orders-table\s*\{[^}]*min-width:\s*1000px/s);
+  assert.match(css, /@media\s*\(max-width:\s*430px\)[\s\S]*?\.orders-table-scroll\s*\{\s*display:\s*none;[\s\S]*?\.orders-cards\s*\{\s*display:\s*grid;/);
+  assert.match(css, /@media\s*\(max-width:\s*640px\)[\s\S]*?\.order-details-dialog\s*\{[^}]*height:\s*100dvh;[^}]*max-height:\s*100dvh/s);
+  assert.equal((css.match(/\.order-product-quantity::before/g) || []).length, 1, "only the mobile layout adds a quantity label");
+});
+
+test("admin order details open on mobile cards and keep internal IDs for verified payment, fulfilment, and notification actions", async () => {
   const tbody = uiElement("tbody");
-  const nodes = { notificationFeedback: uiElement("p"), search: uiElement("input"), filter: uiElement("select") };
-  const orders = [
-    { orderId: "ORD-internal-123", publicReference: "AC-FHS7L", status: "Placed", whatsappNotificationStatus: "failed" },
-    { orderId: "ORD-legacy-456", status: "Placed", whatsappNotificationStatus: "sent" }
-  ];
+  const nodes = makeOrdersPageNodes();
+  const order = {
+    orderId: "ORD-internal-123", publicReference: "AC-FHS7L", status: "Placed", createdAt: "2026-11-08T09:00:00.000Z",
+    customer: { name: "Mani First", phone: "+91 91903 690865", email: "mani@example.test", address: "Bengaluru" },
+    items: [{ name: "Bracelet", qty: 1, price: 99, lineTotal: 99 }],
+    total: 99, paymentAmount: 99, currency: "INR", paymentStatus: "Pending", paymentMethod: "UPI",
+    whatsappNotificationStatus: "failed", customerWhatsAppOptIn: true,
+    whatsappOutbox: [{ key: "event-key-1", type: "customer_order", status: "failed", attempts: 1 }],
+    statusHistory: [{ status: "Placed", at: "2026-11-08T09:00:00.000Z" }]
+  };
   const requests = [];
-  await runBrowserScript("public/orders.js", {
+  const browser = await runBrowserScript("public/orders.js", {
     nodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
     fetchImpl: async (url, options = {}) => {
-      requests.push({ url, method: options.method || "GET" });
-      return { ok: true, json: async () => url === "/api/orders" ? orders : {} };
+      const body = options.body ? JSON.parse(options.body) : undefined;
+      requests.push({ url, method: options.method || "GET", body });
+      if (url === "/api/admin/orders/ORD-internal-123/payment-verification" && body.action === "verify") {
+        order.paymentStatus = "Paid"; order.status = "Preparing";
+      }
+      if (url === "/api/orders/ORD-internal-123") order.status = body.status;
+      return { ok: true, json: async () => url === "/api/orders" ? [order] : { status: "sent" } };
     }
   });
-
   assert.equal(tbody.children[0].children[0].textContent, "AC-FHS7L");
-  assert.equal(tbody.children[1].children[0].textContent, "Legacy: ORD-legacy-456");
-  const statusSelect = tbody.children[0].children[6].children[0];
+  assert.equal(tbody.children[0].children[3].textContent, "1 item");
+  assert.equal(nodes.ordersCards.children.length, 1);
+  await nodes.ordersCards.children[0].handlers.click();
+  assert.equal(nodes.orderDetailsView.hidden, false);
+  assert.equal(browser.document.body.classList.contains("order-details-open"), true);
+
+  let controls = flattenUi(nodes.orderDetailsContent);
+  const utr = controls.find(node => node.tagName === "input");
+  utr.value = "UTR-TEST-123";
+  const verify = controls.find(node => node.tagName === "button" && node.textContent === "Verify payment");
+  await verify.handlers.click();
+  assert.ok(requests.some(request => request.url === "/api/admin/orders/ORD-internal-123/payment-verification" && request.method === "PUT" && request.body.paymentReference === "UTR-TEST-123"));
+  controls = flattenUi(nodes.orderDetailsContent);
+  assert.ok(controls.some(node => node.textContent === "Paid"), "successful server verification updates the payment display");
+  const statusSelect = controls.find(node => node.tagName === "select");
   statusSelect.value = "Shipped";
-  await statusSelect.handlers.change();
-  await tbody.children[0].children[7].children[0].handlers.click();
-  assert.ok(requests.some(request => request.url === "/api/orders/ORD-internal-123" && request.method === "PUT"));
+  const updateStatusButton = controls.find(node => node.tagName === "button" && node.textContent === "Update status");
+  await updateStatusButton.handlers.click();
+  assert.ok(requests.some(request => request.url === "/api/orders/ORD-internal-123" && request.method === "PUT" && request.body.status === "Shipped"));
+
+  controls = flattenUi(nodes.orderDetailsContent);
+  const retryButtons = controls.filter(node => node.tagName === "button" && node.textContent === "Retry");
+  const retryAdmin = retryButtons[0];
+  await retryAdmin.handlers.click();
+  controls = flattenUi(nodes.orderDetailsContent);
+  const retryCustomer = controls.filter(node => node.tagName === "button" && node.textContent === "Retry")[1];
+  await retryCustomer.handlers.click();
   assert.ok(requests.some(request => request.url === "/api/admin/orders/ORD-internal-123/whatsapp-notification/retry" && request.method === "POST"));
+  assert.ok(requests.some(request => request.url === "/api/admin/orders/ORD-internal-123/notifications/event-key-1/retry" && request.method === "POST"));
+
+  await nodes.closeOrderDetails.handlers.click();
+  assert.equal(nodes.orderDetailsView.hidden, true);
+  assert.equal(browser.document.body.classList.contains("order-details-open"), false);
+  assert.equal(nodes.ordersCards.children[0].focused, true, "closing details returns focus to its opener");
+  await nodes.ordersCards.children[0].handlers.click();
+  browser.document.handlers.keydown({ key: "Escape", preventDefault() {} });
+  assert.equal(nodes.orderDetailsView.hidden, true, "Escape closes the details view");
+});
+test("admin order management has clear empty and API failure states", async () => {
+  const tbody = uiElement("tbody");
+  const emptyNodes = makeOrdersPageNodes();
+  await runBrowserScript("public/orders.js", {
+    nodes: emptyNodes, queryNodes: { "#ordersTable tbody": tbody }, requireAdminPage: async () => true,
+    fetchImpl: async () => ({ ok: true, json: async () => [] })
+  });
+  assert.equal(tbody.children[0].children[0].textContent, "No matching orders.");
+  assert.equal(emptyNodes.ordersCards.children[0].textContent, "No matching orders.");
+
+  const failureBody = uiElement("tbody");
+  const failureNodes = makeOrdersPageNodes();
+  await runBrowserScript("public/orders.js", {
+    nodes: failureNodes, queryNodes: { "#ordersTable tbody": failureBody }, requireAdminPage: async () => true,
+    fetchImpl: async () => ({ ok: false, json: async () => ({}) })
+  });
+  assert.equal(failureNodes.ordersCards.children[0].textContent, "Orders are temporarily unavailable. Please refresh.");
 });
 test("customer tracking page renders safe order details, payment state and an evidence-based timeline", async () => {
   const ids = ["orderLookupForm", "orderLookupFeedback", "orderLookupButton", "orderLookupResult", "orderReferenceInput", "orderPhoneInput", "trackedOrderReference", "trackedOrderDate", "trackedPaymentStatus", "trackedFulfilmentStatus", "trackedPaymentPanel", "trackedPaymentMessage", "trackedAmountDue", "trackedQrStatus", "trackedQrImage", "trackedPayeeName", "trackedUpiId", "trackedPayButton", "trackedSharePayment", "trackedContactLink", "trackedOrderItems", "trackedOrderTotal", "trackedOrderTimeline", "trackedTimelineEmpty"];

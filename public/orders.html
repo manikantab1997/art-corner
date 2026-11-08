@@ -1,66 +1,92 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
-    <title>Order History</title>
-    <link rel="stylesheet" href="style.css">
+    <meta charset="utf-8">
+    <title>Order Management | Art Corner Bengaluru</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="style.css">
 </head>
 
-<body>
-
+<body class="admin-orders-page">
     <div id="navbar-container"></div>
 
-    <div class="page-container">
+    <main class="page-container order-management-page">
+        <header class="order-management-heading">
+            <p class="order-management-eyebrow">Art Corner Bengaluru · Admin</p>
+            <h1>Order Management</h1>
+            <p>View and manage customer orders, payments and fulfilment.</p>
+        </header>
 
-        <h1>Order History</h1>
-        <p id="notificationFeedback" role="status" aria-live="polite"></p>
+        <p id="notificationFeedback" class="orders-feedback" role="status" aria-live="polite"></p>
         <p class="admin-notification-guidance">For a WhatsApp notice marked Sending or Unknown for over five minutes, check its delivery record in Meta first. Confirm sent only if Meta accepted it; retry only after confirming Meta did not accept it. Uncertain notices are not resent automatically.</p>
 
-        <div class="orders-filters">
+        <section class="orders-list-panel" aria-label="Customer orders">
+            <div class="orders-toolbar">
+                <label class="orders-search" for="search">
+                    <span aria-hidden="true">⌕</span>
+                    <input id="search" type="search" placeholder="Search by name or order ID" autocomplete="off">
+                </label>
+                <label class="orders-filter-label" for="filter">Fulfilment
+                    <select id="filter">
+                        <option value="all">All statuses</option>
+                        <option value="Placed">Placed</option>
+                        <option value="Preparing">Preparing</option>
+                        <option value="Shipped">Shipped</option>
+                        <option value="Delivered">Delivered</option>
+                        <option value="Cancelled">Cancelled</option>
+                    </select>
+                </label>
+                <label class="orders-filter-label" for="dateFilter">Date
+                    <select id="dateFilter">
+                        <option value="all">All dates</option>
+                        <option value="today">Today</option>
+                        <option value="7days">Last 7 days</option>
+                        <option value="month">This month</option>
+                    </select>
+                </label>
+            </div>
 
-            <input
-                id="search"
-                placeholder="Search by name or order ID"
-            >
-
-            <select id="filter">
-                <option value="all">All</option>
-                <option value="Placed">Placed</option>
-                <option value="Preparing">Preparing</option>
-                <option value="Shipped">Shipped</option>
-                <option value="Delivered">Delivered</option>
-                <option value="Cancelled">Cancelled</option>
-            </select>
-
-        </div>
-
-        <table id="ordersTable">
-
-            <thead>
-                <tr>
-                    <th>Order reference</th>
-                    <th>Name</th>
-                    <th>Phone</th>
-                    <th>Items</th>
-                    <th>Payment</th>
-                    <th>Status</th>
-                    <th>Fulfilment</th>
-                    <th>WhatsApp notice</th>
-                </tr>
-            </thead>
-
-            <tbody></tbody>
-
-        </table>
-
-    </div>
+            <div id="ordersCount" class="orders-count" role="status" aria-live="polite"></div>
+            <div class="orders-table-scroll">
+                <table id="ordersTable" class="orders-table">
+                    <thead>
+                        <tr>
+                            <th scope="col">Order ID</th>
+                            <th scope="col">Customer</th>
+                            <th scope="col">Date</th>
+                            <th scope="col">Items</th>
+                            <th scope="col">Amount</th>
+                            <th scope="col">Payment status</th>
+                            <th scope="col">Fulfilment status</th>
+                            <th scope="col"><span class="visually-hidden">Details</span></th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div id="ordersCards" class="orders-cards" aria-label="Orders"></div>
+        </section>
+    </main>
 
     <div id="footer-container"></div>
 
+    <section id="orderDetailsView" class="order-details-backdrop" role="dialog" aria-modal="true" aria-labelledby="orderDetailsTitle" aria-hidden="true" hidden>
+        <div class="order-details-dialog">
+            <header class="order-details-header">
+                <div>
+                    <p class="order-management-eyebrow">Order details</p>
+                    <h2 id="orderDetailsTitle">Order Details</h2>
+                </div>
+                <button id="closeOrderDetails" class="order-details-close" type="button" aria-label="Close order details">×</button>
+            </header>
+            <p id="detailFeedback" class="orders-feedback" role="status" aria-live="polite"></p>
+            <div id="orderDetailsContent" class="order-details-content"></div>
+        </div>
+    </section>
+
     <script src="js/common.js"></script>
     <script src="orders.js"></script>
-
 </body>
 
 </html>
