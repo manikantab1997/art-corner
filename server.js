@@ -9,6 +9,7 @@ const mongoose = require("mongoose");
 const session = require("express-session");
 const { MongoStore } = require("connect-mongo");
 const { rateLimit } = require("express-rate-limit");
+const QRCode = require("qrcode");
 const { randomUUID, randomBytes, createHash, createHmac, scrypt, timingSafeEqual } = require("crypto");
 const { promisify } = require("util");
 
@@ -18,11 +19,87 @@ const sessionCookieName = "artcorner.sid";
 const sessionMaxAgeMs = 8 * 60 * 60 * 1000;
 const maxAdminPasswordLength = 256;
 const maxProductImageBytes = 5 * 1024 * 1024;
-const validStatuses = ["Placed", "Shipped", "Delivered"];
+const validStatuses = ["Placed", "Preparing", "Shipped", "Delivered", "Cancelled"];
 const supportedImageTypes = new Map([
     [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"],
     [".png", "image/png"], [".webp", "image/webp"], [".gif", "image/gif"]
 ]);
+
+function normalizeCustomerPhone(value) {
+    if (typeof value !== "string" || value.length > 32) return null;
+    const input = value.trim();
+    if (!input || !/^\+?[0-9().\s-]+$/.test(input) || (input.includes("+") && !input.startsWith("+"))) return null;
+    let digits = input.replace(/\D/g, "");
+    let explicitInternational = input.startsWith("+") || digits.startsWith("00");
+    if (digits.startsWith("00")) digits = digits.slice(2);
+
+    // Indian national trunk prefix, optionally used before or after country code.
+    if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+    if (digits.startsWith("91") && digits.length > 10) {
+        digits = digits.slice(2);
+        if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+        if (digits.length !== 10 || !/^[6-9]\d{9}$/.test(digits)) return null;
+        return `91${digits}`;
+    }
+    if (digits.length === 10) return /^[6-9]\d{9}$/.test(digits) ? `91${digits}` : null;
+
+    // Non-Indian numbers must include an international prefix or country code;
+    // preserve valid E.164-length legacy values as their canonical digit string.
+    if ((explicitInternational || digits.length >= 11) && /^[1-9]\d{7,14}$/.test(digits)) return digits;
+    return null;
+}
+
+function safeOrderImageUrl(value) {
+    if (typeof value !== "string") return "";
+    const source = value.trim();
+    if (!source || /[\u0000-\u001f\u007f<>"'`]/.test(source)) return "";
+    if (source.startsWith("/")) {
+        if (source.startsWith("//") || source.includes("\\") || source.split(/[?#]/, 1)[0].split("/").includes("..")) return "";
+        return source;
+    }
+    try {
+        const parsed = new URL(source);
+        return parsed.protocol === "https:" && !parsed.username && !parsed.password ? parsed.href : "";
+    } catch { return ""; }
+}
+
+function validOrderLookupKey(value) {
+    return typeof value === "string" && value.length >= 3 && value.length <= 100 && /^[A-Za-z0-9-]+$/.test(value.trim());
+}
+
+function buildOrderTimeline(order) {
+    const events = [];
+    const validDate = value => {
+        if (value === null || value === undefined || value === "") return null;
+        const date = value instanceof Date ? value : new Date(value);
+        return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+    };
+    const history = Array.isArray(order.statusHistory) ? order.statusHistory : [];
+    for (const entry of history) {
+        const status = typeof entry?.status === "string" ? entry.status : "";
+        if (!["Placed", "Preparing", "Shipped", "Delivered", "Cancelled"].includes(status)) continue;
+        events.push({ type: "fulfilment", status, at: validDate(entry.at) });
+    }
+    if (!events.some(event => event.status === "Placed")) {
+        events.push({ type: "fulfilment", status: "Placed", at: validDate(order.createdAt) });
+    }
+    if (order.paymentVerifiedAt) events.push({ type: "payment", status: "Payment Verified", at: validDate(order.paymentVerifiedAt) });
+    if (order.paymentStatus === "Verification Pending" || order.paymentStatus === "Failed / Mismatch" || order.paymentStatus === "Refunded") {
+        events.push({ type: "payment", status: order.paymentStatus, at: null });
+    }
+    if (typeof order.status === "string" && !events.some(event => event.type === "fulfilment" && event.status === order.status)) {
+        events.push({ type: "fulfilment", status: order.status, at: null });
+    }
+    return events.sort((a, b) => {
+        if (!a.at) return b.at ? 1 : 0;
+        if (!b.at) return -1;
+        const chronological = new Date(a.at) - new Date(b.at);
+        if (chronological !== 0) return chronological;
+        if (a.status === "Payment Verified") return -1;
+        if (b.status === "Payment Verified") return 1;
+        return 0;
+    });
+}
 
 function cloudinaryConfigMissing(env = process.env) {
     return ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
@@ -69,6 +146,24 @@ const orderSchema = new mongoose.Schema({
     publicReference: { type: String, default: undefined },
     customer: { name: String, phone: String, email: String, address: String },
     items: Array,
+    subtotal: { type: Number, min: 0 },
+    total: { type: Number, min: 0 },
+    currency: { type: String, enum: ["INR"] },
+    paymentStatus: { type: String, enum: ["Pending", "Verification Pending", "Paid", "Failed / Mismatch", "Refunded"] },
+    paymentMethod: { type: String, enum: ["UPI", "Card", "Net Banking"] },
+    paymentAmount: { type: Number, min: 0 },
+    paymentReference: { type: String, maxlength: 100 },
+    paymentVerifiedAt: Date,
+    paymentVerifiedBy: String,
+    customerWhatsAppOptIn: { type: Boolean, default: false },
+    customerWhatsAppOptInAt: Date,
+    statusHistory: [{ status: String, at: Date }],
+    whatsappOutbox: [{
+        key: { type: String, required: true },
+        type: { type: String, enum: ["customer_order", "customer_payment_success", "customer_fulfilment"], required: true },
+        status: { type: String, enum: ["pending", "sending", "sent", "failed", "unknown", "not_configured"], default: "pending" },
+        attempts: { type: Number, default: 0 }, createdAt: { type: Date, default: Date.now }, attemptedAt: Date, messageId: String
+    }],
     status: String,
     createdAt: { type: Date, default: Date.now },
     idempotencyKey: { type: String, select: false },
@@ -203,6 +298,45 @@ function generatePublicOrderReference() {
     return `AC-${Array.from(random, byte => alphabet[byte & 31]).join("")}`;
 }
 
+function getUpiPaymentConfig(env = process.env) {
+    const upiId = typeof env.UPI_ID === "string" ? env.UPI_ID.trim() : "";
+    const payeeName = typeof env.UPI_PAYEE_NAME === "string" ? env.UPI_PAYEE_NAME.trim() : "";
+    if (!upiId && !payeeName) return null;
+    // Validate the VPA's general local-part@handle shape without assuming a
+    // particular bank/provider suffix (for example, @okaxis or @upi).
+    if (!upiId || !payeeName || !payeeName.trim() || upiId.length > 100 || payeeName.length > 100 ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}@[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/.test(upiId)) {
+        throw new Error("UPI payment configuration is incomplete or invalid");
+    }
+    return { upiId, payeeName, currency: "INR" };
+}
+
+async function createUpiPaymentDetails(order, { env = process.env, qrCode = QRCode } = {}) {
+    const config = getUpiPaymentConfig(env);
+    const amount = order?.paymentAmount;
+    const reference = order?.publicReference;
+    if (!config || order?.paymentStatus !== "Pending" || typeof amount !== "number" ||
+        !Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(Math.round(amount * 100)) ||
+        amount !== Math.round(amount * 100) / 100 ||
+        typeof reference !== "string" || !/^AC-[A-HJ-NP-Z2-9]{5}$/.test(reference)) {
+        return null;
+    }
+    const params = new URLSearchParams();
+    params.set("pa", config.upiId);
+    params.set("pn", config.payeeName);
+    params.set("am", amount.toFixed(2));
+    params.set("cu", config.currency);
+    params.set("tn", reference);
+    const uri = `upi://pay?${params.toString()}`;
+    let qrCodeDataUrl = null;
+    try {
+        qrCodeDataUrl = await qrCode.toDataURL(uri, { errorCorrectionLevel: "M", margin: 2, width: 280 });
+    } catch {
+        // Keep the URI and manual UPI details available if local QR generation fails.
+    }
+    return { uri, qrCodeDataUrl, upiId: config.upiId, payeeName: config.payeeName, amount, currency: config.currency, reference };
+}
+
 function createOrderConfirmationToken(orderReference, secret, now = Date.now()) {
     const payload = Buffer.from(JSON.stringify({ orderReference, expiresAt: now + 7 * 24 * 60 * 60 * 1000 })).toString("base64url");
     const signature = createHmac("sha256", secret).update(payload).digest("base64url");
@@ -246,12 +380,95 @@ function getWhatsAppConfig(env = process.env) {
     return config;
 }
 
+function getCustomerWhatsAppConfig(env = process.env) {
+    const shared = ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_BUSINESS_RECIPIENT"];
+    const customerTemplates = ["WHATSAPP_CUSTOMER_ORDER_TEMPLATE_NAME", "WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME", "WHATSAPP_CUSTOMER_FULFILMENT_TEMPLATE_NAME"];
+    if (!shared.every(key => typeof env[key] === "string" && env[key].trim()) || !customerTemplates.some(key => env[key]?.trim())) return null;
+    const config = {
+        accessToken: env.WHATSAPP_ACCESS_TOKEN.trim(), phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID.trim(),
+        businessRecipient: env.WHATSAPP_BUSINESS_RECIPIENT.trim(), apiVersion: env.WHATSAPP_API_VERSION || "v23.0",
+        language: env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US",
+        templates: { customer_order: env.WHATSAPP_CUSTOMER_ORDER_TEMPLATE_NAME?.trim(), customer_payment_success: env.WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME?.trim(), customer_fulfilment: env.WHATSAPP_CUSTOMER_FULFILMENT_TEMPLATE_NAME?.trim() }
+    };
+    if (!/^\d+$/.test(config.phoneNumberId) || !/^\d{8,15}$/.test(config.businessRecipient) || !/^v\d+\.\d+$/.test(config.apiVersion) || !/^[a-z]{2}_[A-Z]{2}$/.test(config.language) ||
+        Object.values(config.templates).some(name => name && !/^[a-z0-9_]{1,512}$/.test(name))) throw new Error("Customer WhatsApp configuration is invalid");
+    return config;
+}
+
+function buildWhatsAppClickToChat(order, businessRecipient) {
+    const reference = order.publicReference || order.orderId;
+    const amount = Number(order.paymentAmount ?? order.total);
+    if (!/^\d{8,15}$/.test(businessRecipient || "") || !reference || !Number.isFinite(amount) || amount < 0) return null;
+    const message = `Hello Art Corner Bengaluru, I have paid for order ${reference} (₹${amount.toFixed(2)}). My UPI transaction reference/UTR is: . I will attach my payment screenshot here.`;
+    return `https://wa.me/${businessRecipient}?text=${encodeURIComponent(message)}`;
+}
+
+function getConfiguredBusinessRecipient(env = process.env) {
+    const value = typeof env.WHATSAPP_BUSINESS_RECIPIENT === "string" ? env.WHATSAPP_BUSINESS_RECIPIENT.trim() : "";
+    return /^\d{8,15}$/.test(value) ? value : null;
+}
+
+function buildCustomerWhatsAppPayload(order, event, config) {
+    let to = String(order.customer?.phone || "").replace(/\D/g, "");
+    if (to.length === 10) to = `91${to}`;
+    else if (to.length === 11 && to.startsWith("0")) to = `91${to.slice(1)}`;
+    if (!/^\d{8,15}$/.test(to)) return null;
+    const reference = String(order.publicReference || order.orderId || "").slice(0, 100);
+    const amount = Number(order.paymentAmount ?? order.total);
+    const templateName = config.templates[event.type];
+    if (!templateName || !Number.isFinite(amount)) return null;
+    const shareUrl = buildWhatsAppClickToChat(order, config.businessRecipient) || "";
+    let values;
+    if (event.type === "customer_order") values = [String(order.customer?.name || "Customer").slice(0, 100), reference, amount.toFixed(2), shareUrl];
+    else if (event.type === "customer_payment_success") values = [String(order.customer?.name || "Customer").slice(0, 100), reference, amount.toFixed(2)];
+    else values = [String(order.customer?.name || "Customer").slice(0, 100), reference, String(order.status || "").slice(0, 40)];
+    return { messaging_product: "whatsapp", recipient_type: "individual", to, type: "template", template: { name: templateName, language: { code: config.language }, components: [{ type: "body", parameters: values.map(text => ({ type: "text", text })) }] } };
+}
+
+async function sendCustomerWhatsAppNotification(order, event, { env = process.env, fetchImpl = globalThis.fetch } = {}) {
+    let config;
+    try { config = getCustomerWhatsAppConfig(env); } catch { return { status: "not_configured" }; }
+    if (!config || !config.templates[event.type]) return { status: "not_configured" };
+    const payload = buildCustomerWhatsAppPayload(order, event, config);
+    if (!payload || typeof fetchImpl !== "function") return { status: "failed" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+        const response = await fetchImpl(`https://graph.facebook.com/${config.apiVersion}/${config.phoneNumberId}/messages`, { method: "POST", signal: controller.signal, headers: { Authorization: `Bearer ${config.accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        if (!response.ok) return { status: response.status >= 500 ? "unknown" : "failed" };
+        const result = await response.json().catch(() => ({}));
+        return { status: "sent", messageId: typeof result.messages?.[0]?.id === "string" ? result.messages[0].id : undefined };
+    } catch { return { status: "unknown" }; } finally { clearTimeout(timeout); }
+}
+
+async function processWhatsAppOutboxEvent(orderId, eventKey, { retry = false, env = process.env, fetchImpl = globalThis.fetch } = {}) {
+    const allowed = retry ? ["failed", "not_configured", "pending"] : ["pending"];
+    const order = await Order.findOneAndUpdate({ orderId, customerWhatsAppOptIn: true, whatsappOutbox: { $elemMatch: { key: eventKey, status: { $in: allowed } } } }, {
+        $set: { "whatsappOutbox.$.status": "sending", "whatsappOutbox.$.attemptedAt": new Date() }, $inc: { "whatsappOutbox.$.attempts": 1 }
+    }, { new: true });
+    if (!order) return { status: "not_retryable" };
+    const event = order.whatsappOutbox.find(item => item.key === eventKey);
+    const outcome = await sendCustomerWhatsAppNotification(order, event, { env, fetchImpl });
+    try {
+        const saved = await Order.updateOne({ orderId, "whatsappOutbox.key": eventKey, "whatsappOutbox.status": "sending" }, { $set: { "whatsappOutbox.$.status": outcome.status, ...(outcome.messageId ? { "whatsappOutbox.$.messageId": outcome.messageId } : {}) } });
+        if (saved.matchedCount !== 1 || saved.modifiedCount !== 1) {
+            console.error("Customer WhatsApp notification outcome could not be saved; reconciliation is required");
+            return { status: "unknown" };
+        }
+    } catch {
+        console.error("Customer WhatsApp notification outcome could not be saved; reconciliation is required");
+        return { status: "unknown" };
+    }
+    return outcome;
+}
+
 function buildWhatsAppOrderPayload(order, config) {
     const items = Array.isArray(order.items) ? order.items : [];
     const itemText = items.map(item => `${String(item.name || "Item").slice(0, 80)} × ${Number(item.qty ?? item.quantity) || 0}`).join(", ").slice(0, 900) || "No item details";
-    const total = items.every(item => Number.isFinite(Number(item.price)) && Number.isFinite(Number(item.qty ?? item.quantity)))
+    const legacyTotal = items.every(item => Number.isFinite(Number(item.price)) && Number.isFinite(Number(item.qty ?? item.quantity)))
         ? items.reduce((sum, item) => sum + Number(item.price) * Number(item.qty ?? item.quantity), 0)
         : null;
+    const total = typeof order.total === "number" && Number.isFinite(order.total) && order.total >= 0 ? order.total : legacyTotal;
     const components = [String(order.orderId).slice(0, 100), itemText, total === null ? "Not available" : total.toFixed(2), String(order._id).slice(0, 100)];
     return {
         messaging_product: "whatsapp", recipient_type: "individual", to: config.recipient,
@@ -322,6 +539,40 @@ async function processOrderWhatsAppNotification(orderId, { retry = false, env = 
     return outcome;
 }
 
+async function processWhatsAppQueueOnce({ env = process.env, fetchImpl = globalThis.fetch } = {}) {
+    // Process a small bounded batch so notifications remain asynchronous and do
+    // not delay order creation, verification, or server startup.
+    await recoverStaleWhatsAppNotifications();
+    const adminOrders = await Order.find({ whatsappNotificationStatus: "pending" }).select({ orderId: 1 }).limit(10).lean();
+    for (const order of adminOrders) {
+        try { await processOrderWhatsAppNotification(order.orderId, { env, fetchImpl }); }
+        catch { console.error("Admin WhatsApp notification processing failed; it remains available for reconciliation"); }
+    }
+    const customerOrders = await Order.find({ customerWhatsAppOptIn: true, "whatsappOutbox.status": "pending" }).select({ orderId: 1, whatsappOutbox: 1 }).limit(10).lean();
+    for (const order of customerOrders) {
+        const event = (order.whatsappOutbox || []).find(item => item.status === "pending");
+        if (!event) continue;
+        try { await processWhatsAppOutboxEvent(order.orderId, event.key, { env, fetchImpl }); }
+        catch { console.error("Customer WhatsApp notification processing failed; it remains queued for retry"); }
+    }
+}
+
+const notificationStaleAfterMs = 5 * 60 * 1000;
+async function recoverStaleWhatsAppNotifications(now = new Date()) {
+    const staleBefore = new Date(now.getTime() - notificationStaleAfterMs);
+    // A stale "sending" state has an uncertain provider outcome. Move it to
+    // unknown for explicit admin reconciliation; never retry it automatically.
+    await Order.updateMany(
+        { whatsappNotificationStatus: "sending", whatsappNotificationAttemptedAt: { $lt: staleBefore } },
+        { $set: { whatsappNotificationStatus: "unknown" } }
+    );
+    await Order.updateMany(
+        { whatsappOutbox: { $elemMatch: { status: "sending", attemptedAt: { $lt: staleBefore } } } },
+        { $set: { "whatsappOutbox.$[event].status": "unknown" } },
+        { arrayFilters: [{ "event.status": "sending", "event.attemptedAt": { $lt: staleBefore } }] }
+    );
+}
+
 function parsePasswordHash(encoded) {
     if (typeof encoded !== "string") return null;
     const match = /^scrypt\$([a-f\d]{32})\$([a-f\d]{128})$/i.exec(encoded);
@@ -361,7 +612,9 @@ function createApp({
     cloudinaryClient = cloudinary,
     cloudinaryConfigured = cloudinaryConfigMissing().length === 0,
     whatsappEnv = process.env,
-    whatsappFetch = globalThis.fetch
+    whatsappFetch = globalThis.fetch,
+    upiEnv = process.env,
+    qrCodeGenerator = QRCode
 } = {}) {
     if (production && (!sessionStore || sessionStore instanceof session.MemoryStore)) {
         throw new Error("A persistent session store is required in production");
@@ -437,6 +690,21 @@ function createApp({
         legacyHeaders: false,
         message: { error: "Too many login attempts. Please try again in 15 minutes." },
         ...(rateLimitStore ? { store: rateLimitStore } : {})
+    });
+    const orderLookupIpLimiter = rateLimit({
+        windowMs: 15 * 60 * 1000,
+        limit: 30,
+        standardHeaders: "draft-8",
+        legacyHeaders: false,
+        message: { error: "Too many order lookup attempts. Please wait before trying again." }
+    });
+    const orderLookupPhoneLimiter = rateLimit({
+        windowMs: 15 * 60 * 1000,
+        limit: 5,
+        standardHeaders: "draft-8",
+        legacyHeaders: false,
+        keyGenerator: req => createHash("sha256").update(normalizeCustomerPhone(req.body?.phone) || "invalid-phone").digest("hex"),
+        message: { error: "Too many order lookup attempts. Please wait before trying again." }
     });
 
     app.get("/api/admin/session", (req, res) => {
@@ -704,14 +972,108 @@ function createApp({
         const orderReference = verifyOrderConfirmationToken(req.get("X-Order-Confirmation"), sessionSecret);
         if (!orderReference) return res.status(401).json({ error: "Order confirmation could not be verified" });
         const query = orderReference.startsWith("AC-") ? { publicReference: orderReference } : { orderId: orderReference };
-        const order = await Order.findOne(query).select({ orderId: 1, publicReference: 1, status: 1, items: 1 }).lean();
+        const order = await Order.findOne(query).select({ orderId: 1, publicReference: 1, status: 1, items: 1, paymentStatus: 1, paymentAmount: 1, currency: 1, customerWhatsAppOptIn: 1 }).lean();
         if (!order) return res.status(404).json({ error: "Order confirmation is unavailable" });
         const items = Array.isArray(order.items) ? order.items.map(item => ({
             name: typeof item.name === "string" ? item.name : "Handmade item",
             qty: Number.isSafeInteger(Number(item.qty)) && Number(item.qty) > 0 ? Number(item.qty) : 1,
             price: Number.isFinite(Number(item.price)) ? Number(item.price) : null
         })) : [];
-        res.json({ publicReference: order.publicReference || order.orderId, status: order.status || "Placed", items });
+        let upiPayment = null;
+        try {
+            upiPayment = await createUpiPaymentDetails(order, { env: upiEnv, qrCode: qrCodeGenerator });
+        } catch {
+            console.error("UPI payment instructions could not be prepared");
+        }
+        res.json({
+            publicReference: order.publicReference || order.orderId,
+            status: order.status || "Placed",
+            items,
+            paymentStatus: order.paymentStatus || null,
+            paymentAmount: Number.isFinite(order.paymentAmount) ? order.paymentAmount : null,
+            currency: order.currency || null,
+            upiPayment,
+            ...(order.customerWhatsAppOptIn === true && buildWhatsAppClickToChat(order, getConfiguredBusinessRecipient(whatsappEnv) || "") ? { sharePaymentDetailsUrl: buildWhatsAppClickToChat(order, getConfiguredBusinessRecipient(whatsappEnv) || "") } : {})
+        });
+    });
+
+    app.post("/api/order-lookup", orderLookupIpLimiter, orderLookupPhoneLimiter, async (req, res) => {
+        const rawReference = typeof req.body?.orderReference === "string" ? req.body.orderReference.trim() : "";
+        const phone = normalizeCustomerPhone(req.body?.phone);
+        if (!rawReference || !req.body?.phone) return res.status(400).json({ error: "Enter both the order reference and the mobile number used at checkout." });
+        if (!phone) return res.status(400).json({ error: "Enter a valid mobile number, including its country code when needed." });
+        if (!validOrderLookupKey(rawReference)) return res.status(404).json({ error: "Order not found or the details do not match." });
+
+        let orderQuery;
+        if (/^AC-/i.test(rawReference)) orderQuery = { publicReference: rawReference.toUpperCase() };
+        else if (/^ORD-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawReference)) {
+            orderQuery = { orderId: new RegExp(`^${rawReference.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") };
+        } else orderQuery = { orderId: rawReference };
+        const order = await Order.findOne(orderQuery).select({
+            _id: 0, orderId: 1, publicReference: 1, "customer.phone": 1, items: 1, subtotal: 1, total: 1, currency: 1,
+            paymentStatus: 1, paymentMethod: 1, paymentAmount: 1, paymentVerifiedAt: 1, status: 1,
+            statusHistory: 1, createdAt: 1, customerWhatsAppOptIn: 1
+        }).lean();
+        if (!order || normalizeCustomerPhone(order.customer?.phone) !== phone) {
+            return res.status(404).json({ error: "Order not found or the details do not match." });
+        }
+
+        const items = Array.isArray(order.items) ? order.items : [];
+        const missingImageIds = [...new Set(items.filter(item => !safeOrderImageUrl(item.image) && mongoose.isValidObjectId(item.productId)).map(item => String(item.productId)))];
+        const productImages = new Map();
+        if (missingImageIds.length) {
+            try {
+                const products = await Product.find({ _id: { $in: missingImageIds } }).select({ _id: 1, image: 1 }).lean();
+                products.forEach(product => productImages.set(String(product._id), safeOrderImageUrl(product.image)));
+            } catch {
+                console.error("Product images could not be loaded for order tracking");
+            }
+        }
+        const publicItems = items.map(item => {
+            const rawQuantity = item.qty ?? item.quantity;
+            const quantity = Number.isSafeInteger(Number(rawQuantity)) && Number(rawQuantity) > 0 ? Number(rawQuantity) : null;
+            const numericPrice = item.price === null || item.price === undefined || item.price === "" ? NaN : Number(item.price);
+            const price = Number.isFinite(numericPrice) && numericPrice >= 0 ? numericPrice : null;
+            const image = safeOrderImageUrl(item.image) || productImages.get(String(item.productId)) || "";
+            const numericLineTotal = item.lineTotal === null || item.lineTotal === undefined || item.lineTotal === "" ? NaN : Number(item.lineTotal);
+            return {
+                name: typeof item.name === "string" ? item.name : "Handmade item",
+                qty: quantity,
+                price,
+                lineTotal: Number.isFinite(numericLineTotal) && numericLineTotal >= 0 ? numericLineTotal : price === null || quantity === null ? null : Math.round(price * quantity * 100) / 100,
+                ...(image ? { image } : {})
+            };
+        });
+        const publicReference = typeof order.publicReference === "string" && order.publicReference ? order.publicReference : order.orderId;
+        const recipient = getConfiguredBusinessRecipient(whatsappEnv);
+        const paymentOrder = { ...order, publicReference };
+        let upiPayment = null;
+        if (order.paymentStatus === "Pending") {
+            try { upiPayment = await createUpiPaymentDetails(paymentOrder, { env: upiEnv, qrCode: qrCodeGenerator }); }
+            catch { console.error("UPI payment instructions could not be prepared for order tracking"); }
+        }
+        const contactWhatsAppUrl = recipient
+            ? `https://wa.me/${recipient}?text=${encodeURIComponent(`Hello Art Corner Bengaluru, I have a question about order ${publicReference}.`)}`
+            : null;
+        const sharePaymentDetailsUrl = order.customerWhatsAppOptIn === true && recipient
+            ? buildWhatsAppClickToChat(paymentOrder, recipient)
+            : null;
+        res.json({
+            publicReference,
+            orderDate: order.createdAt && Number.isFinite(new Date(order.createdAt).getTime()) ? new Date(order.createdAt).toISOString() : null,
+            items: publicItems,
+            subtotal: Number.isFinite(order.subtotal) ? order.subtotal : null,
+            total: Number.isFinite(order.total) ? order.total : Number.isFinite(order.paymentAmount) ? order.paymentAmount : null,
+            currency: typeof order.currency === "string" ? order.currency : null,
+            paymentStatus: ["Pending", "Verification Pending", "Paid", "Failed / Mismatch", "Refunded"].includes(order.paymentStatus) ? order.paymentStatus : null,
+            paymentMethod: ["UPI", "Card", "Net Banking"].includes(order.paymentMethod) ? order.paymentMethod : null,
+            paymentAmount: Number.isFinite(order.paymentAmount) ? order.paymentAmount : null,
+            status: ["Placed", "Preparing", "Shipped", "Delivered", "Cancelled"].includes(order.status) ? order.status : "Placed",
+            timeline: buildOrderTimeline(order),
+            upiPayment,
+            ...(sharePaymentDetailsUrl ? { sharePaymentDetailsUrl } : {}),
+            ...(contactWhatsAppUrl ? { contactWhatsAppUrl } : {})
+        });
     });
 
     app.post("/api/orders", async (req, res) => {
@@ -722,16 +1084,113 @@ function createApp({
         if (idempotencyKey !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
             return res.status(400).json({ error: "Idempotency-Key must be a UUID v4" });
         }
-        const requestHash = createHash("sha256").update(JSON.stringify(req.body || {})).digest("hex");
+        const body = req.body;
+        const customerInput = body?.customer;
+        if (!customerInput || typeof customerInput !== "object" || Array.isArray(customerInput)) {
+            return res.status(400).json({ error: "Valid customer and delivery details are required" });
+        }
+        const customer = {
+            name: typeof customerInput.name === "string" ? customerInput.name.trim() : "",
+            phone: normalizeCustomerPhone(customerInput.phone) || "",
+            email: typeof customerInput.email === "string" ? customerInput.email.trim() : "",
+            address: typeof customerInput.address === "string" ? customerInput.address.trim() : ""
+        };
+        if (customer.name.length < 2 || customer.name.length > 160 ||
+            !customer.phone ||
+            customer.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email) ||
+            customer.address.length < 8 || customer.address.length > 500) {
+            return res.status(400).json({ error: "Customer name, phone number (Indian mobile or international with country code), email, or delivery address is invalid" });
+        }
+        if (body?.whatsappOptIn !== undefined && typeof body.whatsappOptIn !== "boolean") {
+            return res.status(400).json({ error: "WhatsApp consent must be true or false" });
+        }
+        const requestedItems = body?.items;
+        if (!Array.isArray(requestedItems) || requestedItems.length === 0 || requestedItems.length > 50) {
+            return res.status(400).json({ error: "Add between 1 and 50 products to your order" });
+        }
+        const productIds = [];
+        const quantities = new Map();
+        for (const item of requestedItems) {
+            if (!item || typeof item !== "object" || Array.isArray(item) ||
+                typeof item._id !== "string" || !mongoose.isValidObjectId(item._id)) {
+                return res.status(400).json({ error: "An order contains an invalid product ID" });
+            }
+            if (!Number.isSafeInteger(item.qty) || item.qty < 1 || item.qty > 99) {
+                return res.status(400).json({ error: "Product quantities must be whole numbers from 1 to 99" });
+            }
+            const productId = item._id.toLowerCase();
+            if (quantities.has(productId)) return res.status(400).json({ error: "A product cannot appear more than once in an order" });
+            productIds.push(item._id);
+            quantities.set(productId, item.qty);
+        }
+        const requestHash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
         try {
+            // Resolve retries before checking current stock, so a completed checkout
+            // can be recovered even if the product sells out immediately afterward.
+            const priorOrder = await Order.findOne({ idempotencyKey }).select("+idempotencyKey +requestHash");
+            if (priorOrder) {
+                if (priorOrder.requestHash !== requestHash) {
+                    return res.status(409).json({ error: "This checkout key was already used for a different order" });
+                }
+                return res.status(200).json({
+                    orderId: priorOrder.orderId,
+                    publicReference: priorOrder.publicReference || priorOrder.orderId,
+                    confirmationToken: createOrderConfirmationToken(priorOrder.publicReference || priorOrder.orderId, sessionSecret),
+                    subtotal: priorOrder.subtotal,
+                    total: priorOrder.total
+                });
+            }
+
+            // Never persist a new payable order unless usable UPI instructions
+            // can be generated. Existing idempotent retries are resolved above.
+            let upiConfig;
+            try { upiConfig = getUpiPaymentConfig(upiEnv); }
+            catch { return res.status(503).json({ error: "UPI payments are temporarily unavailable. Please try again later or contact the store." }); }
+            if (!upiConfig) return res.status(503).json({ error: "UPI payments are temporarily unavailable. Please try again later or contact the store." });
+
+            const products = await Product.find({ _id: { $in: productIds } }).lean();
+            const productsById = new Map(products.map(product => [String(product._id).toLowerCase(), product]));
+            if (productsById.size !== productIds.length) {
+                return res.status(400).json({ error: "One or more products are no longer available" });
+            }
+            const orderItems = [];
+            let totalPaise = 0;
+            for (const [productId, quantity] of quantities) {
+                const product = productsById.get(productId);
+                if (!product.inStock) return res.status(409).json({ error: `${product.name || "A product"} is out of stock` });
+                const price = product.price;
+                const pricePaise = Math.round(price * 100);
+                if (typeof product.name !== "string" || !product.name.trim() ||
+                    typeof price !== "number" || !Number.isFinite(price) || price < 0 || !Number.isSafeInteger(pricePaise)) {
+                    return res.status(409).json({ error: "A product has invalid saved pricing and cannot be ordered" });
+                }
+                const lineTotalPaise = pricePaise * quantity;
+                if (!Number.isSafeInteger(lineTotalPaise) || !Number.isSafeInteger(totalPaise + lineTotalPaise)) {
+                    return res.status(400).json({ error: "The order total is outside the supported range" });
+                }
+                totalPaise += lineTotalPaise;
+                orderItems.push({
+                    productId: String(product._id), name: product.name,
+                    price: pricePaise / 100, qty: quantity, lineTotal: lineTotalPaise / 100,
+                    ...(safeOrderImageUrl(product.image) ? { image: safeOrderImageUrl(product.image) } : {})
+                });
+            }
+            const total = totalPaise / 100;
+            if (total <= 0) return res.status(400).json({ error: "The order total must be greater than ₹0.00 for UPI checkout." });
             const orderId = `ORD-${randomUUID()}`;
             let initialNotificationStatus = "pending";
             try { if (!getWhatsAppConfig(whatsappEnv)) initialNotificationStatus = "not_configured"; }
             catch { initialNotificationStatus = "not_configured"; }
+            const customerWhatsAppOptIn = body.whatsappOptIn === true;
+            const orderPlacedAt = new Date();
             const newOrder = new Order({
-                ...req.body, orderId, publicReference: generatePublicOrderReference(), status: "Placed",
-                ...(idempotencyKey ? { idempotencyKey, requestHash } : {}),
-                whatsappNotificationStatus: initialNotificationStatus
+                orderId, publicReference: generatePublicOrderReference(), customer, items: orderItems,
+                subtotal: total, total, currency: "INR", paymentStatus: "Pending", paymentAmount: total,
+                status: "Placed", createdAt: orderPlacedAt, statusHistory: [{ status: "Placed", at: orderPlacedAt }], idempotencyKey, requestHash,
+                whatsappNotificationStatus: initialNotificationStatus,
+                customerWhatsAppOptIn,
+                ...(customerWhatsAppOptIn ? { customerWhatsAppOptInAt: new Date() } : {}),
+                whatsappOutbox: customerWhatsAppOptIn ? [{ key: randomUUID(), type: "customer_order", status: "pending", attempts: 0 }] : []
             });
             let orderSaved = false;
             for (let attempt = 0; attempt < 5 && !orderSaved; attempt++) {
@@ -743,17 +1202,12 @@ function createApp({
                     newOrder.publicReference = generatePublicOrderReference();
                 }
             }
-            try {
-                if (initialNotificationStatus === "pending") {
-                    await processOrderWhatsAppNotification(orderId, { env: whatsappEnv, fetchImpl: whatsappFetch });
-                }
-            } catch {
-                console.error("WhatsApp notification processing failed; order remains saved for reconciliation");
-            }
             res.status(201).json({
                 orderId,
                 publicReference: newOrder.publicReference,
-                confirmationToken: createOrderConfirmationToken(newOrder.publicReference, sessionSecret)
+                confirmationToken: createOrderConfirmationToken(newOrder.publicReference, sessionSecret),
+                subtotal: newOrder.subtotal,
+                total: newOrder.total
             });
         } catch (error) {
             if (error.code === 11000 && idempotencyKey) {
@@ -851,16 +1305,80 @@ function createApp({
         return res.json({ status: outcome.status });
     });
 
+    app.put("/api/admin/orders/:id/payment-verification", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const { action, paymentReference } = req.body || {};
+        if (!["record_reference", "verify", "mismatch"].includes(action)) return res.status(400).json({ error: "Choose record_reference, verify, or mismatch" });
+        const reference = typeof paymentReference === "string" ? paymentReference.trim() : "";
+        if ((action === "record_reference" && !reference) || (reference && (reference.length > 100 || /[\u0000-\u001f\u007f]/.test(reference)))) return res.status(400).json({ error: "Enter a valid UTR or transaction reference (1–100 characters)" });
+        if (action === "record_reference") {
+            const order = await Order.findOneAndUpdate({ orderId: req.params.id, paymentStatus: { $in: ["Pending", "Verification Pending"] } }, { $set: { paymentReference: reference, paymentStatus: "Verification Pending" } }, { new: true });
+            if (!order) {
+                const exists = await Order.exists({ orderId: req.params.id });
+                return res.status(exists ? 409 : 404).json({ error: exists ? "This legacy or non-pending order cannot accept a payment reference" : "Order not found" });
+            }
+            return res.json({ orderId: order.orderId, paymentStatus: order.paymentStatus, paymentReference: order.paymentReference });
+        }
+        const filter = { orderId: req.params.id, paymentStatus: { $in: ["Pending", "Verification Pending"] } };
+        if (action === "verify") {
+            const event = { key: randomUUID(), type: "customer_payment_success", status: "pending", attempts: 0, createdAt: new Date() };
+            const verifiedAt = new Date();
+            const update = { $set: { paymentStatus: "Paid", status: "Preparing", paymentVerifiedAt: verifiedAt, paymentVerifiedBy: adminUsername || "admin" }, $push: { statusHistory: { status: "Preparing", at: verifiedAt } } };
+            if (reference) update.$set.paymentReference = reference;
+            const pre = await Order.findOne(filter).select({ customerWhatsAppOptIn: 1, paymentStatus: 1 });
+            if (!pre) {
+                const exists = await Order.exists({ orderId: req.params.id });
+                return res.status(exists ? 409 : 404).json({ error: exists ? "Payment is not eligible for verification; legacy or already-processed orders are unchanged" : "Order not found" });
+            }
+            if (!["Pending", "Verification Pending"].includes(pre.paymentStatus)) return res.status(409).json({ error: "Payment is not eligible for verification; legacy or already-processed orders are unchanged" });
+            if (pre.customerWhatsAppOptIn === true) update.$push.whatsappOutbox = event;
+            const order = await Order.findOneAndUpdate(filter, update, { new: true, runValidators: true });
+            if (!order) return res.status(409).json({ error: "Payment changed concurrently; refresh the order before retrying" });
+            return res.json({ message: "Payment verified", orderId: order.orderId, paymentStatus: order.paymentStatus, status: order.status, paymentVerifiedAt: order.paymentVerifiedAt, paymentVerifiedBy: order.paymentVerifiedBy });
+        }
+        const order = await Order.findOneAndUpdate(filter, { $set: { paymentStatus: "Failed / Mismatch", ...(reference ? { paymentReference: reference } : {}) } }, { new: true, runValidators: true });
+        if (!order) {
+            const exists = await Order.exists({ orderId: req.params.id });
+            return res.status(exists ? 409 : 404).json({ error: exists ? "Payment is not eligible for mismatch marking; legacy or already-processed orders are unchanged" : "Order not found" });
+        }
+        return res.json({ message: "Payment flagged for review", orderId: order.orderId, paymentStatus: order.paymentStatus, status: order.status });
+    });
+
     app.put("/api/orders/:id", requireTrustedOrigin, requireAdmin, async (req, res) => {
         const { status } = req.body || {};
-        if (!validStatuses.includes(status)) {
-            return res.status(400).json({ error: "Status must be Placed, Shipped, or Delivered" });
-        }
-        const order = await Order.findOneAndUpdate(
-            { orderId: req.params.id }, { status }, { new: true, runValidators: true }
-        );
-        if (!order) return res.status(404).json({ error: "Order not found" });
+        if (!validStatuses.includes(status)) return res.status(400).json({ error: "Status must be Placed, Preparing, Shipped, Delivered, or Cancelled" });
+        const current = await Order.findOne({ orderId: req.params.id }).select({ status: 1, paymentStatus: 1, customerWhatsAppOptIn: 1 });
+        if (!current) return res.status(404).json({ error: "Order not found" });
+        if (["Preparing", "Shipped", "Delivered"].includes(status) && current.paymentStatus && current.paymentStatus !== "Paid") return res.status(409).json({ error: "Verify payment before advancing fulfilment" });
+        if (current.status === status) return res.json({ message: "Status unchanged", orderId: req.params.id, status });
+        const filter = { orderId: req.params.id, status: current.status };
+        if (current.paymentStatus !== undefined) filter.paymentStatus = current.paymentStatus;
+        const changedAt = new Date();
+        const update = { $set: { status }, $push: { statusHistory: { status, at: changedAt } } };
+        if (current.customerWhatsAppOptIn === true) update.$push.whatsappOutbox = { key: randomUUID(), type: "customer_fulfilment", status: "pending", attempts: 0, createdAt: changedAt };
+        const order = await Order.findOneAndUpdate(filter, update, { new: true, runValidators: true });
+        if (!order) return res.status(409).json({ error: "Order changed concurrently; refresh and try again" });
         res.json({ message: "Status updated", orderId: order.orderId, status: order.status });
+    });
+
+    app.post("/api/admin/orders/:id/notifications/:key/retry", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        const outcome = await processWhatsAppOutboxEvent(req.params.id, req.params.key, { retry: true, env: whatsappEnv, fetchImpl: whatsappFetch });
+        if (outcome.status === "not_retryable") return res.status(409).json({ error: "Notification is not retryable. Reconcile uncertain delivery before retrying." });
+        return res.json({ status: outcome.status });
+    });
+
+    app.post("/api/admin/orders/:id/notifications/:key/confirm-sent", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        if (req.body?.confirmed !== true) return res.status(400).json({ error: "Explicit confirmation is required" });
+        const result = await Order.updateOne({ orderId: req.params.id, whatsappOutbox: { $elemMatch: { key: req.params.key, status: { $in: ["unknown", "sending"] }, attemptedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } } } }, { $set: { "whatsappOutbox.$.status": "sent" } });
+        if (!result.modifiedCount) return res.status(409).json({ error: "Only an uncertain notification older than five minutes can be reconciled" });
+        res.json({ status: "sent" });
+    });
+
+    app.post("/api/admin/orders/:id/notifications/:key/confirm-not-sent-retry", requireTrustedOrigin, requireAdmin, async (req, res) => {
+        if (req.body?.confirmedNotSent !== true) return res.status(400).json({ error: "Explicit confirmation is required" });
+        const result = await Order.updateOne({ orderId: req.params.id, whatsappOutbox: { $elemMatch: { key: req.params.key, status: { $in: ["unknown", "sending"] }, attemptedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } } } }, { $set: { "whatsappOutbox.$.status": "failed" } });
+        if (!result.modifiedCount) return res.status(409).json({ error: "Only an uncertain notification older than five minutes can be reconciled" });
+        const outcome = await processWhatsAppOutboxEvent(req.params.id, req.params.key, { retry: true, env: whatsappEnv, fetchImpl: whatsappFetch });
+        return res.json({ status: outcome.status });
     });
 
     app.use(express.static(publicDirectory));
@@ -970,7 +1488,14 @@ async function startServer() {
         production: process.env.NODE_ENV === "production"
     });
     const port = process.env.PORT || 3000;
-    productionApp.listen(port, () => console.log(`Server running on port ${port}`));
+    productionApp.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+        const notificationWorker = setInterval(() => {
+            processWhatsAppQueueOnce().catch(() => console.error("WhatsApp notification queue could not be checked"));
+        }, 15000);
+        notificationWorker.unref();
+        processWhatsAppQueueOnce().catch(() => console.error("WhatsApp notification queue could not be checked"));
+    });
 }
 
 if (require.main === module) {
@@ -980,4 +1505,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady, runStartupStage };
+module.exports = { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, parsePasswordHash, verifyPassword, validateProductionConfig, validateStorefrontOrigin, sessionCookieName, hasSupportedImageSignature, uploadImageToCloudinary, getWhatsAppConfig, getCustomerWhatsAppConfig, buildCustomerWhatsAppPayload, buildWhatsAppClickToChat, sendCustomerWhatsAppNotification, processWhatsAppOutboxEvent, processWhatsAppQueueOnce, recoverStaleWhatsAppNotifications, normalizeCustomerPhone, safeOrderImageUrl, validOrderLookupKey, buildOrderTimeline, getUpiPaymentConfig, createUpiPaymentDetails, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification, processOrderWhatsAppNotification, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady, runStartupStage };

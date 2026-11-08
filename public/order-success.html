@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Order confirmed | Art Corner Bengaluru</title>
+    <title>Order payment | Art Corner Bengaluru</title>
     <link rel="stylesheet" href="style.css">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
@@ -10,11 +10,33 @@
     <div id="navbar-container"></div>
     <main class="page-container order-success-page">
         <section id="orderSuccessCard" class="order-success-card" aria-live="polite" aria-busy="true">
-            <div class="order-success-mark" aria-hidden="true">✓</div>
+            <div id="orderSuccessMark" class="order-success-mark" aria-hidden="true">✓</div>
             <p class="home-eyebrow">MADE WITH CARE</p>
             <h1 id="orderSuccessHeading">Checking your order…</h1>
             <p id="orderSuccessMessage" role="status">Please wait while we verify your confirmation.</p>
             <div id="orderSuccessDetails" class="order-success-details" hidden></div>
+            <section id="upiPaymentPanel" class="upi-payment-panel" aria-labelledby="upiPaymentHeading" hidden>
+                <h2 id="upiPaymentHeading">Payment pending</h2>
+                <p id="upiPaymentAmount" class="upi-payment-amount"></p>
+                <p id="upiPaymentReference"></p>
+                <div class="upi-payment-layout">
+                    <div class="upi-qr-card">
+                        <p id="upiQrStatus" role="status" aria-live="polite">Preparing your payment QR…</p>
+                        <img id="upiQrImage" alt="Order-specific UPI payment QR code" hidden>
+                    </div>
+                    <div class="upi-payment-instructions">
+                        <p>Pay to <strong id="upiPayeeName"></strong></p>
+                        <p>UPI ID: <code id="upiIdValue"></code></p>
+                        <button id="copyUpiIdButton" class="secondary-link-button" type="button">Copy UPI ID</button>
+                        <a id="upiPayButton" class="primary-link-button" hidden>Pay using UPI</a>
+                        <p id="upiAppHelp" class="upi-app-help"></p>
+                    </div>
+                </div>
+                <p id="upiPaymentUnavailable" class="upi-payment-unavailable" role="status" hidden></p>
+                <p class="upi-payment-next-step">After paying, send your UTR or transaction reference and attach your payment screenshot using the secure WhatsApp link below.</p>
+                <a id="sharePaymentDetailsLink" class="secondary-link-button" hidden target="_blank" rel="noopener noreferrer">Share Payment Details on WhatsApp</a>
+                <p class="upi-payment-manual-verification">Your order will be confirmed for preparation after we manually verify your payment.</p>
+            </section>
             <div class="order-success-actions">
                 <a class="primary-link-button" href="products.html">Continue Shopping</a>
                 <a class="secondary-link-button" href="index.html">Back to Home</a>

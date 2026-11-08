@@ -7,9 +7,12 @@ const http = require("node:http");
 const { spawnSync } = require("node:child_process");
 const { randomBytes, scryptSync } = require("node:crypto");
 process.env.NODE_ENV = "test";
+// Fixed, non-secret configuration for mocked UPI checkout tests.
+process.env.UPI_ID = "checkout.test@upi";
+process.env.UPI_PAYEE_NAME = "Art Corner Test";
 const session = require("express-session");
 const cookieSignature = require("cookie-signature");
-const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, verifySessionStoreReady, runStartupStage } = require("../server");
+const { app, Product, Order, Category, CategoryCounter, createApp, seedLegacyCategories, validateProductionConfig, sessionCookieName, hasSupportedImageSignature, generatePublicOrderReference, createOrderConfirmationToken, verifyOrderConfirmationToken, createUpiPaymentDetails, normalizeCustomerPhone, buildOrderTimeline, recoverStaleWhatsAppNotifications, verifySessionStoreReady, runStartupStage } = require("../server");
 
 const originals = new Map();
 function stub(target, name, value) {
@@ -56,6 +59,12 @@ const authApp = createApp({
 });
 const testOrigin = "https://storefront.example.test";
 const testSessionSecret = "integration-test-session-secret-with-more-than-32-characters";
+const testProductId = "64b64c0f1f1f1f1f1f1f1f1f";
+const validCheckoutBody = (items = [{ _id: testProductId, qty: 2, name: "Client name", price: 1 }]) => ({
+  customer: { name: "A Customer", phone: "9876543210", email: "customer@example.com", address: "Bengaluru delivery address" },
+  items
+});
+const productFindResult = products => ({ lean: async () => products });
 function makeCloudinaryMock({ fail = false } = {}) {
   const uploaded = [];
   const deleted = [];
@@ -259,6 +268,7 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", pri
     name: { value: "A Customer", addEventListener() {}, setCustomValidity() {}, focus() {} },
     phone: { value: "9876543210", addEventListener() {}, setCustomValidity() {}, focus() {} },
     email: { value: "customer@example.com", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    whatsappOptIn: { checked: false },
     address: { value: "Bengaluru delivery address", addEventListener() {}, setCustomValidity() {}, focus() {} },
     nameError: { textContent: "" }, phoneError: { textContent: "" }, emailError: { textContent: "" }, addressError: { textContent: "" }
   };
@@ -279,6 +289,34 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", pri
     crypto: { randomUUID: () => "123e4567-e89b-42d3-a456-426614174000" }
   });
   return { nodes, window, storage, sessionStorage };
+}
+async function orderSuccessBrowser({ responseBody, clipboard = async () => {} }) {
+  const ids = [
+    "orderSuccessHeading", "orderSuccessMessage", "orderSuccessDetails", "orderSuccessCard", "orderSuccessMark",
+    "upiPaymentPanel", "upiPaymentAmount", "upiPaymentReference", "upiQrImage", "upiQrStatus", "upiPayeeName",
+    "upiIdValue", "copyUpiIdButton", "upiPayButton", "upiAppHelp", "upiPaymentUnavailable", "sharePaymentDetailsLink"
+  ];
+  const nodes = Object.fromEntries(ids.map(id => [id, uiElement(id)]));
+  nodes.orderSuccessDetails.hidden = true;
+  nodes.upiPaymentPanel.hidden = true;
+  nodes.upiQrImage.hidden = true;
+  nodes.copyUpiIdButton.hidden = true;
+  nodes.upiPayButton.hidden = true;
+  nodes.upiPaymentUnavailable.hidden = true;
+  const sessionStorage = { getItem: key => key === "artcorner.order.confirmation" ? JSON.stringify({ token: "test-confirmation-token", publicReference: "AC-7K2P9" }) : null };
+  const document = { getElementById: id => nodes[id] || null, createElement: tag => uiElement(tag) };
+  const fetchCalls = [];
+  const source = fs.readFileSync(path.join(__dirname, "../public/order-success.js"), "utf8");
+  vm.runInNewContext(source, {
+    document, sessionStorage, URL,
+    fetch: async (url, options) => {
+      fetchCalls.push({ url, options });
+      return { ok: true, json: async () => responseBody };
+    },
+    navigator: { clipboard: { writeText: clipboard } }, console
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  return { nodes, fetchCalls };
 }
 async function cartBrowser({ cart = [], products = [{ _id: "p1", inStock: true }] } = {}) {
   const storage = new Map([...(cart === undefined ? [] : [["cart", JSON.stringify(cart)]])]);
@@ -322,6 +360,7 @@ function uiElement(tagName = "div") {
     replaceChildren(...children) { this.children = children; this._innerHTML = ""; },
     addEventListener(type, handler) { this.handlers[type] = handler; },
     setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; if (name === "src") this.src = ""; },
     reset() { this.resetCalled = true; },
     focus() { this.focused = true; },
     remove() { this.removed = true; },
@@ -380,29 +419,223 @@ test("PUT /api/products/:id rejects malformed IDs before database access", async
   assert.equal(response.body.error, "Invalid product ID");
 });
 test("PUT /api/orders/:id validates status before database access", async () => {
-  const response = await invoke(routeStack("put", "/api/orders/:id").at(-1), { body: { status: "Cancelled" } });
+  const response = await invoke(routeStack("put", "/api/orders/:id").at(-1), { body: { status: "Unexpected" } });
   assert.equal(response.statusCode, 400);
   assert.match(response.body.error, /Status must be/);
 });
 test("POST /api/orders returns a persisted order ID in a success response", async () => {
   const originalSave = Order.prototype.save;
-  Order.prototype.save = async function () { return this; };
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  let savedOrder;
+  Product.find = filter => {
+    assert.deepEqual(filter._id.$in, [testProductId]);
+    return productFindResult([{ _id: testProductId, name: "Database candle", price: 125.5, inStock: true }]);
+  };
+  Order.findOne = filter => ({ select: async () => {
+    assert.equal(filter.idempotencyKey, "123e4567-e89b-42d3-a456-426614174000");
+    return null;
+  } });
+  Order.prototype.save = async function () { savedOrder = this; return this; };
   try {
+    const submittedBody = validCheckoutBody();
+    submittedBody.customer.isAdmin = true;
+    submittedBody.total = 0;
+    submittedBody.paymentStatus = "Paid";
+    submittedBody.status = "Delivered";
     const response = await invoke(routeStack("post", "/api/orders").at(-1), {
-      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] },
+      body: submittedBody,
       headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(response.statusCode, 201);
     assert.match(response.body.orderId, /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(response.body.publicReference, /^AC-[A-HJ-NP-Z2-9]{5}$/);
     assert.match(response.body.confirmationToken, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    assert.deepEqual(savedOrder.items, [{ productId: testProductId, name: "Database candle", price: 125.5, qty: 2, lineTotal: 251 }]);
+    assert.equal(savedOrder.subtotal, 251);
+    assert.equal(savedOrder.total, 251);
+    assert.equal(savedOrder.currency, "INR");
+    assert.equal(savedOrder.paymentAmount, 251);
+    assert.equal(savedOrder.paymentStatus, "Pending");
+    assert.equal(savedOrder.status, "Placed");
+    assert.equal(savedOrder.customer.phone, "919876543210", "new orders store the canonical phone number");
+    assert.equal(savedOrder.customerWhatsAppOptIn, false);
+    assert.deepEqual(savedOrder.whatsappOutbox, []);
+    assert.equal(savedOrder.customer.isAdmin, undefined);
     const missingKey = await invoke(routeStack("post", "/api/orders").at(-1), {
-      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 250, qty: 1 }] }
+      body: validCheckoutBody()
     });
     assert.equal(missingKey.statusCode, 400);
   } finally {
     Order.prototype.save = originalSave;
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
   }
+});
+
+test("customer phone normalization accepts Indian formats and explicit international numbers, rejecting invalid lengths", () => {
+  for (const input of ["9876543210", "+91 98765 43210", "91-9876543210", "09876543210", "0091 09876543210", "+91 (0) 98765-43210"]) {
+    assert.equal(normalizeCustomerPhone(input), "919876543210", input);
+  }
+  assert.equal(normalizeCustomerPhone("+1 (415) 555-2671"), "14155552671");
+  assert.equal(normalizeCustomerPhone("14155552671"), "14155552671", "legacy unprefixed international country-code form remains searchable");
+  for (const input of ["1234567", "987654321", "1234567890", "9198765432101234", "+91 12345 67890", "98abc6543210"]) {
+    assert.equal(normalizeCustomerPhone(input), null, input);
+  }
+});
+
+test("new order creation rejects invalid phone lengths before product lookup", async () => {
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  let productLookups = 0;
+  Product.find = () => { productLookups++; return productFindResult([]); };
+  Order.findOne = () => ({ select: async () => null });
+  try {
+    const invalid = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: { ...validCheckoutBody(), customer: { ...validCheckoutBody().customer, phone: "1234567" } },
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.match(invalid.body.error, /phone number/i);
+    assert.equal(productLookups, 0);
+  } finally {
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
+  }
+});
+
+test("new payment orders require valid UPI configuration before product lookup or persistence", async () => {
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  const originalSave = Order.prototype.save;
+  let productLookups = 0;
+  let saves = 0;
+  Product.find = () => { productLookups++; return productFindResult([]); };
+  Order.findOne = () => ({ select: async () => null });
+  Order.prototype.save = async function () { saves++; return this; };
+  try {
+    for (const upiEnv of [{}, { UPI_ID: "test@upi" }, { UPI_ID: "invalid-vpa", UPI_PAYEE_NAME: "Test" }]) {
+      const paymentApp = createApp({ storefrontOrigin: "http://localhost:3000", upiEnv });
+      const response = await invoke(routeStack("post", "/api/orders", paymentApp).at(-1), {
+        body: validCheckoutBody(),
+        headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+      });
+      assert.equal(response.statusCode, 503);
+      assert.match(response.body.error, /UPI payments are temporarily unavailable/i);
+      assert.doesNotMatch(response.body.error, /test@upi|invalid-vpa|Test/);
+    }
+    assert.equal(productLookups, 0);
+    assert.equal(saves, 0);
+  } finally {
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
+    Order.prototype.save = originalSave;
+  }
+});
+
+test("idempotent checkout recovery does not depend on current UPI configuration", async () => {
+  const originalOrderFindOne = Order.findOne;
+  const body = validCheckoutBody();
+  const requestHash = require("node:crypto").createHash("sha256").update(JSON.stringify(body)).digest("hex");
+  Order.findOne = () => ({ select: async () => ({ orderId: "ORD-existing", publicReference: "AC-7K2P9", requestHash, subtotal: 25, total: 25 }) });
+  try {
+    const paymentApp = createApp({ storefrontOrigin: "http://localhost:3000", upiEnv: {} });
+    const response = await invoke(routeStack("post", "/api/orders", paymentApp).at(-1), {
+      body, headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.orderId, "ORD-existing");
+    assert.equal(response.body.publicReference, "AC-7K2P9");
+  } finally { Order.findOne = originalOrderFindOne; }
+});
+
+test("UPI VPA validation accepts different provider handles without relying on a fixed suffix", async () => {
+  for (const upiId of ["maker@upi", "maker.name@okaxis", "maker_1@bank-handle", "1234567890@pay.example"]) {
+    const payment = await createUpiPaymentDetails({ publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 25 }, {
+      env: { UPI_ID: upiId, UPI_PAYEE_NAME: "Test Payee" }, qrCode: { toDataURL: async () => "data:image/png;base64,cXJjb2Rl" }
+    });
+    assert.equal(payment.upiId, upiId);
+  }
+});
+
+test("zero-total UPI orders are rejected and never saved", async () => {
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  const originalSave = Order.prototype.save;
+  let saves = 0;
+  Order.findOne = () => ({ select: async () => null });
+  Product.find = () => productFindResult([{ _id: testProductId, name: "Free sample", price: 0, inStock: true }]);
+  Order.prototype.save = async function () { saves++; return this; };
+  try {
+    const response = await invoke(routeStack("post", "/api/orders").at(-1), {
+      body: validCheckoutBody([{ _id: testProductId, qty: 1 }]),
+      headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
+    });
+    assert.equal(response.statusCode, 400);
+    assert.match(response.body.error, /greater than ₹0\.00/i);
+    assert.equal(saves, 0);
+  } finally {
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
+    Order.prototype.save = originalSave;
+  }
+});
+
+test("POST /api/orders ignores client prices and rejects malformed, missing and out-of-stock products", async () => {
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  const originalSave = Order.prototype.save;
+  let saveCount = 0;
+  let lookupCount = 0;
+  Order.findOne = () => ({ select: async () => null });
+  Product.find = () => {
+    lookupCount++;
+    return productFindResult([{ _id: testProductId, name: "Trusted name", price: 40, inStock: true }]);
+  };
+  Order.prototype.save = async function () { saveCount++; return this; };
+  const handler = routeStack("post", "/api/orders").at(-1);
+  const headers = { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" };
+  try {
+    const manipulated = await invoke(handler, { body: validCheckoutBody([{ _id: testProductId, qty: 1, name: "Injected name", price: 0.01 }]), headers });
+    assert.equal(manipulated.statusCode, 201);
+    assert.equal(manipulated.body.total, 40);
+
+    const invalidId = await invoke(handler, { body: validCheckoutBody([{ _id: "not-an-id", qty: 1 }]), headers });
+    assert.equal(invalidId.statusCode, 400);
+    assert.match(invalidId.body.error, /invalid product ID/i);
+    assert.equal(lookupCount, 1, "invalid IDs are rejected before querying products");
+
+    const invalidQuantity = await invoke(handler, { body: validCheckoutBody([{ _id: testProductId, qty: 1.5 }]), headers });
+    assert.equal(invalidQuantity.statusCode, 400);
+    assert.match(invalidQuantity.body.error, /whole numbers/i);
+
+    Product.find = () => productFindResult([]);
+    const missing = await invoke(handler, { body: validCheckoutBody([{ _id: testProductId, qty: 1 }]), headers });
+    assert.equal(missing.statusCode, 400);
+    assert.match(missing.body.error, /no longer available/i);
+
+    Product.find = () => productFindResult([{ _id: testProductId, name: "Unavailable candle", price: 40, inStock: false }]);
+    const outOfStock = await invoke(handler, { body: validCheckoutBody([{ _id: testProductId, qty: 1 }]), headers });
+    assert.equal(outOfStock.statusCode, 409);
+    assert.match(outOfStock.body.error, /out of stock/i);
+    assert.equal(saveCount, 1, "only the valid order was persisted");
+  } finally {
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
+    Order.prototype.save = originalSave;
+  }
+});
+
+test("new payment fields remain absent on legacy orders and UPI config is centralized and optional", () => {
+  const legacy = Order.hydrate({ orderId: "ORD-legacy", status: "Shipped", items: [] });
+  assert.equal(legacy.paymentStatus, undefined);
+  assert.equal(legacy.paymentAmount, undefined);
+  const { getUpiPaymentConfig } = require("../server");
+  assert.equal(getUpiPaymentConfig({}), null);
+  assert.deepEqual(getUpiPaymentConfig({ UPI_ID: "artcorner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" }), {
+    upiId: "artcorner@bank", payeeName: "Art Corner Bengaluru", currency: "INR"
+  });
+  assert.throws(() => getUpiPaymentConfig({ UPI_ID: "artcorner@bank" }), /incomplete or invalid/);
 });
 test("WhatsApp Cloud API uses an approved template with order details and does not expose provider errors", async () => {
   const { getWhatsAppConfig, buildWhatsAppOrderPayload, sendWhatsAppOrderNotification } = require("../server");
@@ -412,12 +645,13 @@ test("WhatsApp Cloud API uses an approved template with order details and does n
   };
   const config = getWhatsAppConfig(env);
   const payload = buildWhatsAppOrderPayload({
-    _id: "order-ref", orderId: "ORD-test", items: [{ name: "Candle", price: 250, qty: 2 }]
+    _id: "order-ref", orderId: "ORD-test", total: 420, items: [{ name: "Candle", price: 250, qty: 2 }]
   }, config);
-  assert.deepEqual(payload.template.components[0].parameters.map(parameter => parameter.text), ["ORD-test", "Candle × 2", "500.00", "order-ref"]);
+  assert.deepEqual(payload.template.components[0].parameters.map(parameter => parameter.text), ["ORD-test", "Candle × 2", "420.00", "order-ref"]);
+  assert.equal(buildWhatsAppOrderPayload({ orderId: "ORD-legacy", items: [{ name: "Candle", price: 250, qty: 2 }] }, config).template.components[0].parameters[2].text, "500.00");
   let requestOptions;
   const sent = await sendWhatsAppOrderNotification({
-    _id: "order-ref", orderId: "ORD-test", items: [{ name: "Candle", price: 250, qty: 2 }]
+    _id: "order-ref", orderId: "ORD-test", total: 420, items: [{ name: "Candle", price: 250, qty: 2 }]
   }, { env, fetchImpl: async (url, options) => {
     assert.match(url, /^https:\/\/graph\.facebook\.com\/v\d+\.\d+\/1234567890\/messages$/);
     requestOptions = options;
@@ -434,24 +668,17 @@ test("WhatsApp Cloud API uses an approved template with order details and does n
   assert.throws(() => getWhatsAppConfig({ ...env, WHATSAPP_TEMPLATE_NAME: undefined }), /incomplete/);
 });
 
-test("order persistence succeeds when WhatsApp notification fails and happens only after save", async () => {
+test("order persistence queues WhatsApp after save without synchronously sending", async () => {
   let saved = false;
-  let recordedStatus;
   const originalSave = Order.prototype.save;
   const originalFindOne = Order.findOne;
-  const originalFindOneAndUpdate = Order.findOneAndUpdate;
-  const originalUpdateOne = Order.updateOne;
+  const originalProductFind = Product.find;
   let persistedOrder;
   Order.prototype.save = async function () { saved = true; this._id = "saved-order-ref"; persistedOrder = this; return this; };
-  Order.findOne = async () => persistedOrder;
-  Order.findOneAndUpdate = async (_filter, update) => ({
-    _id: "saved-order-ref", orderId: "ORD-test", items: [], ...update.$set
-  });
-  Order.updateOne = async (_filter, update) => {
-    assert.equal(saved, true, "notification runs only after order persistence");
-    recordedStatus = update.$set.whatsappNotificationStatus;
-    return { modifiedCount: 1 };
-  };
+  Order.findOne = filter => filter.idempotencyKey
+    ? { select: async () => null }
+    : Promise.resolve(persistedOrder);
+  Product.find = () => productFindResult([{ _id: testProductId, name: "Database Sample", price: 10, inStock: true }]);
   const configuredEnv = {
     WHATSAPP_ACCESS_TOKEN: "test-token", WHATSAPP_PHONE_NUMBER_ID: "1234567890",
     WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_TEMPLATE_NAME: "new_order_notice"
@@ -459,37 +686,267 @@ test("order persistence succeeds when WhatsApp notification fails and happens on
   try {
     const testOrderApp = createApp({
       storefrontOrigin: "http://localhost:3000", whatsappEnv: configuredEnv,
-      whatsappFetch: async () => {
-        assert.equal(saved, true, "WhatsApp request begins only after the order is saved");
-        throw new Error("test-only network failure");
-      }
+      whatsappFetch: async () => { throw new Error("queue must not call provider during checkout"); }
     });
     const handler = routeStack("post", "/api/orders", testOrderApp).at(-1);
     const response = await invoke(handler, {
-      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] },
+      body: { ...validCheckoutBody([{ _id: testProductId, qty: 1 }]), whatsappOptIn: true },
       headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(response.statusCode, 201);
     assert.match(response.body.orderId, /^ORD-/);
     assert.equal(saved, true);
-    assert.equal(recordedStatus, "unknown", "ambiguous provider failure is recorded for reconciliation");
+    assert.equal(persistedOrder.whatsappNotificationStatus, "pending");
+    assert.equal(persistedOrder.customerWhatsAppOptIn, true);
+    assert.equal(persistedOrder.whatsappOutbox.length, 1);
+    assert.equal(persistedOrder.whatsappOutbox[0].type, "customer_order");
   } finally {
     Order.prototype.save = originalSave;
     Order.findOne = originalFindOne;
+    Product.find = originalProductFind;
+  }
+});
+
+test("customer WhatsApp templates use the trusted amount and an encoded click-to-chat payment request", () => {
+  const { getCustomerWhatsAppConfig, buildCustomerWhatsAppPayload, buildWhatsAppClickToChat } = require("../server");
+  const env = {
+    WHATSAPP_ACCESS_TOKEN: "mock-token", WHATSAPP_PHONE_NUMBER_ID: "1234567890", WHATSAPP_BUSINESS_RECIPIENT: "919380125087",
+    WHATSAPP_CUSTOMER_ORDER_TEMPLATE_NAME: "customer_order_confirmation",
+    WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME: "customer_payment_success",
+    WHATSAPP_CUSTOMER_FULFILMENT_TEMPLATE_NAME: "customer_fulfilment_update"
+  };
+  const config = getCustomerWhatsAppConfig(env);
+  const order = { orderId: "ORD-internal", publicReference: "AC-7K2P9", paymentAmount: 325.5, total: 999, status: "Placed", customer: { name: "A Customer", phone: "+91 98765 43210" } };
+  const payload = buildCustomerWhatsAppPayload(order, { type: "customer_order" }, config);
+  assert.equal(payload.to, "919876543210");
+  assert.deepEqual(payload.template.components[0].parameters.map(value => value.text), ["A Customer", "AC-7K2P9", "325.50", buildWhatsAppClickToChat(order, "919380125087")]);
+  const share = new URL(buildWhatsAppClickToChat(order, "919380125087"));
+  assert.equal(share.hostname, "wa.me");
+  assert.match(share.searchParams.get("text"), /AC-7K2P9/);
+  assert.match(share.searchParams.get("text"), /₹325\.50/);
+  assert.match(share.searchParams.get("text"), /UTR/);
+  assert.match(share.searchParams.get("text"), /screenshot/);
+  assert.equal(getCustomerWhatsAppConfig({}), null);
+});
+test("customer WhatsApp delivery failures are recorded without changing payment state", async () => {
+  const { processWhatsAppOutboxEvent } = require("../server");
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalUpdateOne = Order.updateOne;
+  let persistedNotificationStatus;
+  let sendCount = 0;
+  const order = {
+    orderId: "ORD-queue", publicReference: "AC-7K2P9", paymentStatus: "Paid", paymentAmount: 123.45,
+    customerWhatsAppOptIn: true, status: "Preparing", customer: { name: "Customer", phone: "9876543210" },
+    whatsappOutbox: [{ key: "event-1", type: "customer_payment_success", status: "sending" }]
+  };
+  Order.findOneAndUpdate = async (_filter, _update) => {
+    const retryStates = _filter.whatsappOutbox.$elemMatch.status.$in;
+    if (sendCount > 0 && !retryStates.includes("failed")) return null;
+    sendCount++;
+    return order;
+  };
+  Order.updateOne = async (_filter, update) => { persistedNotificationStatus = update.$set["whatsappOutbox.$.status"]; return { matchedCount: 1, modifiedCount: 1 }; };
+  try {
+    const outcome = await processWhatsAppOutboxEvent("ORD-queue", "event-1", {
+      env: { WHATSAPP_ACCESS_TOKEN: "mock", WHATSAPP_PHONE_NUMBER_ID: "1234567890", WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME: "payment_success" },
+      fetchImpl: async () => ({ ok: false, status: 400 })
+    });
+    assert.deepEqual(outcome, { status: "failed" });
+    assert.equal(persistedNotificationStatus, "failed");
+    assert.equal(order.paymentStatus, "Paid");
+    const retried = await processWhatsAppOutboxEvent("ORD-queue", "event-1", {
+      retry: true,
+      env: { WHATSAPP_ACCESS_TOKEN: "mock", WHATSAPP_PHONE_NUMBER_ID: "1234567890", WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME: "payment_success" },
+      fetchImpl: async () => ({ ok: true, json: async () => ({ messages: [{ id: "test-message" }] }) })
+    });
+    assert.equal(retried.status, "sent");
+    assert.equal(persistedNotificationStatus, "sent");
+    const duplicate = await processWhatsAppOutboxEvent("ORD-queue", "event-1", {
+      env: { WHATSAPP_ACCESS_TOKEN: "mock", WHATSAPP_PHONE_NUMBER_ID: "1234567890", WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_CUSTOMER_PAYMENT_TEMPLATE_NAME: "payment_success" },
+      fetchImpl: async () => { throw new Error("must not resend sent event"); }
+    });
+    assert.equal(duplicate.status, "not_retryable");
+    assert.equal(sendCount, 2);
+  } finally {
     Order.findOneAndUpdate = originalFindOneAndUpdate;
     Order.updateOne = originalUpdateOne;
+  }
+});
+
+test("stale sending notifications become unknown for manual reconciliation and are not automatically retried", async () => {
+  const originalUpdateMany = Order.updateMany;
+  const updates = [];
+  Order.updateMany = async (...args) => { updates.push(args); return { modifiedCount: 1 }; };
+  try {
+    await recoverStaleWhatsAppNotifications(new Date("2026-11-08T12:00:00.000Z"));
+    assert.equal(updates.length, 2);
+    const expectedCutoff = new Date("2026-11-08T11:55:00.000Z");
+    assert.deepEqual(updates[0][0], { whatsappNotificationStatus: "sending", whatsappNotificationAttemptedAt: { $lt: expectedCutoff } });
+    assert.deepEqual(updates[0][1], { $set: { whatsappNotificationStatus: "unknown" } });
+    assert.deepEqual(updates[1][0], { whatsappOutbox: { $elemMatch: { status: "sending", attemptedAt: { $lt: expectedCutoff } } } });
+    assert.deepEqual(updates[1][1], { $set: { "whatsappOutbox.$[event].status": "unknown" } });
+    assert.deepEqual(updates[1][2].arrayFilters, [{ "event.status": "sending", "event.attemptedAt": { $lt: expectedCutoff } }]);
+  } finally { Order.updateMany = originalUpdateMany; }
+});
+
+test("concurrent notification workers can claim an opted-in outbox event only once", async () => {
+  const { processWhatsAppOutboxEvent } = require("../server");
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalUpdateOne = Order.updateOne;
+  let status = "pending";
+  let sends = 0;
+  const order = { orderId: "ORD-race", publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 20, total: 20,
+    customerWhatsAppOptIn: true, customer: { name: "Customer", phone: "919876543210" },
+    whatsappOutbox: [{ key: "event-race", type: "customer_order", status: "sending" }] };
+  Order.findOneAndUpdate = async filter => {
+    const allowed = filter.whatsappOutbox.$elemMatch.status.$in;
+    if (!allowed.includes(status)) return null;
+    status = "sending";
+    return order;
+  };
+  Order.updateOne = async (_filter, update) => {
+    status = update.$set["whatsappOutbox.$.status"];
+    return { matchedCount: 1, modifiedCount: 1 };
+  };
+  const env = { WHATSAPP_ACCESS_TOKEN: "mock-token", WHATSAPP_PHONE_NUMBER_ID: "1234567890", WHATSAPP_BUSINESS_RECIPIENT: "919380125087", WHATSAPP_CUSTOMER_ORDER_TEMPLATE_NAME: "customer_order" };
+  try {
+    const results = await Promise.all([1, 2].map(() => processWhatsAppOutboxEvent("ORD-race", "event-race", {
+      env, fetchImpl: async () => { sends++; return { ok: true, json: async () => ({ messages: [{ id: "mock-message" }] }) }; }
+    })));
+    assert.equal(sends, 1);
+    assert.equal(results.filter(result => result.status === "sent").length, 1);
+    assert.equal(results.filter(result => result.status === "not_retryable").length, 1);
+    assert.equal(status, "sent");
+  } finally {
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    Order.updateOne = originalUpdateOne;
+  }
+});
+
+test("customer outbox reconciliation requires explicit confirmation and never retries an uncertain send automatically", async () => {
+  const originalUpdateOne = Order.updateOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  let updateCount = 0;
+  Order.updateOne = async () => { updateCount++; return { matchedCount: 1, modifiedCount: 1 }; };
+  Order.findOneAndUpdate = async () => null;
+  try {
+    const notificationApp = createApp({ storefrontOrigin: "http://localhost:3000", whatsappEnv: {} });
+    const confirmSent = routeStack("post", "/api/admin/orders/:id/notifications/:key/confirm-sent", notificationApp).at(-1);
+    assert.equal((await invoke(confirmSent, { params: { id: "ORD-1", key: "evt-1" }, body: {} })).statusCode, 400);
+    assert.equal((await invoke(confirmSent, { params: { id: "ORD-1", key: "evt-1" }, body: { confirmed: true } })).statusCode, 200);
+    const retryUnsent = routeStack("post", "/api/admin/orders/:id/notifications/:key/confirm-not-sent-retry", notificationApp).at(-1);
+    assert.equal((await invoke(retryUnsent, { params: { id: "ORD-1", key: "evt-1" }, body: {} })).statusCode, 400);
+    assert.equal((await invoke(retryUnsent, { params: { id: "ORD-1", key: "evt-1" }, body: { confirmedNotSent: true } })).statusCode, 200);
+    assert.equal(updateCount, 2, "one sent reconciliation and one mark-failed step; no blind send occurs when the event cannot be claimed");
+  } finally {
+    Order.updateOne = originalUpdateOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("admin payment verification atomically records UTR, marks Paid and starts fulfilment once", async () => {
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalExists = Order.exists;
+  let updateCall = 0;
+  let captured;
+  Order.findOne = () => ({ select: async () => ({ customerWhatsAppOptIn: true, paymentStatus: "Pending" }) });
+  Order.findOneAndUpdate = async (filter, update) => {
+    captured = { filter, update };
+    updateCall++;
+    return updateCall === 1 ? { orderId: "ORD-internal", paymentStatus: "Paid", status: "Preparing", paymentVerifiedAt: new Date(), paymentVerifiedBy: "admin" } : null;
+  };
+  Order.exists = async () => true;
+  try {
+    const handler = routeStack("put", "/api/admin/orders/:id/payment-verification").at(-1);
+    const first = await invoke(handler, { params: { id: "ORD-internal" }, body: { action: "verify", paymentReference: " UTR-123 " } });
+    assert.equal(first.statusCode, 200);
+    assert.equal(captured.filter.paymentStatus.$in.includes("Pending"), true);
+    assert.equal(captured.update.$set.paymentStatus, "Paid");
+    assert.equal(captured.update.$set.status, "Preparing");
+    assert.equal(captured.update.$set.paymentVerifiedBy, "admin");
+    assert.equal(captured.update.$set.paymentReference, "UTR-123");
+    assert.equal(captured.update.$push.whatsappOutbox.type, "customer_payment_success");
+    const duplicate = await invoke(handler, { params: { id: "ORD-internal" }, body: { action: "verify" } });
+    assert.equal(duplicate.statusCode, 409);
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    Order.exists = originalExists;
+  }
+});
+
+test("payment mismatch does not mark paid and legacy orders remain ineligible", async () => {
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalExists = Order.exists;
+  let update;
+  Order.findOne = () => ({ select: async () => ({ customerWhatsAppOptIn: false, paymentStatus: "Pending" }) });
+  Order.findOneAndUpdate = async (_filter, value) => { update = value; return { orderId: "ORD-pending", paymentStatus: "Failed / Mismatch", status: "Placed" }; };
+  Order.exists = async () => true;
+  try {
+    const handler = routeStack("put", "/api/admin/orders/:id/payment-verification").at(-1);
+    const recorded = await invoke(handler, { params: { id: "ORD-pending" }, body: { action: "record_reference", paymentReference: "UTR-RECORDED" } });
+    assert.equal(recorded.statusCode, 200);
+    assert.equal(update.$set.paymentReference, "UTR-RECORDED");
+    assert.equal(update.$set.paymentStatus, "Verification Pending");
+    const mismatch = await invoke(handler, { params: { id: "ORD-pending" }, body: { action: "mismatch", paymentReference: "UTR-BAD" } });
+    assert.equal(mismatch.statusCode, 200);
+    assert.equal(update.$set.paymentStatus, "Failed / Mismatch");
+    assert.equal(update.$set.status, undefined);
+    assert.equal(update.$push, undefined);
+    Order.findOne = () => ({ select: async () => ({ customerWhatsAppOptIn: undefined, paymentStatus: undefined }) });
+    Order.findOneAndUpdate = async () => null;
+    const legacy = await invoke(handler, { params: { id: "ORD-legacy" }, body: { action: "verify" } });
+    assert.equal(legacy.statusCode, 409);
+    assert.match(legacy.body.error, /legacy/);
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    Order.exists = originalExists;
+  }
+});
+
+test("fulfilment status changes are limited to valid transitions and queue only changed opted-in statuses", async () => {
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  let current = { status: "Preparing", paymentStatus: "Paid", customerWhatsAppOptIn: true };
+  let captured;
+  Order.findOne = () => ({ select: async () => ({ ...current }) });
+  Order.findOneAndUpdate = async (filter, update) => { captured = { filter, update }; return { orderId: "ORD-1", status: update.$set.status }; };
+  try {
+    const handler = routeStack("put", "/api/orders/:id").at(-1);
+    const invalid = await invoke(handler, { params: { id: "ORD-1" }, body: { status: "Unknown" } });
+    assert.equal(invalid.statusCode, 400);
+    const changed = await invoke(handler, { params: { id: "ORD-1" }, body: { status: "Shipped" } });
+    assert.equal(changed.statusCode, 200);
+    assert.equal(captured.update.$set.status, "Shipped");
+    assert.equal(captured.update.$push.whatsappOutbox.type, "customer_fulfilment");
+    current = { status: "Preparing", paymentStatus: "Pending", customerWhatsAppOptIn: true };
+    const unpaid = await invoke(handler, { params: { id: "ORD-1" }, body: { status: "Shipped" } });
+    assert.equal(unpaid.statusCode, 409);
+    current = { status: "Shipped", paymentStatus: "Paid", customerWhatsAppOptIn: false };
+    captured = undefined;
+    await invoke(handler, { params: { id: "ORD-1" }, body: { status: "Shipped" } });
+    assert.equal(captured, undefined, "unchanged status does not write or enqueue a duplicate message");
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
   }
 });
 test("checkout idempotency returns the existing order without sending a second notification", async () => {
   const originalSave = Order.prototype.save;
   const originalFindOne = Order.findOne;
-  const savedPayload = { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] };
+  const originalProductFind = Product.find;
+  const savedPayload = validCheckoutBody([{ _id: testProductId, name: "Sample", price: 10, qty: 1 }]);
   const requestHash = require("node:crypto").createHash("sha256").update(JSON.stringify(savedPayload)).digest("hex");
-  Order.prototype.save = async function () { const error = new Error("duplicate key"); error.code = 11000; throw error; };
+  let existingAvailable = false;
+  Order.prototype.save = async function () { existingAvailable = true; const error = new Error("duplicate key"); error.code = 11000; throw error; };
+  Product.find = () => productFindResult([{ _id: testProductId, name: "Database Sample", price: 10, inStock: true }]);
   let lookupFilter;
   Order.findOne = filter => {
     lookupFilter = filter;
-    return { select: async () => ({ orderId: "ORD-existing", requestHash }) };
+    return { select: async () => existingAvailable ? ({ orderId: "ORD-existing", requestHash }) : null };
   };
   try {
     const response = await invoke(routeStack("post", "/api/orders").at(-1), {
@@ -501,13 +958,14 @@ test("checkout idempotency returns the existing order without sending a second n
     assert.equal(typeof response.body.confirmationToken, "string");
     assert.equal(lookupFilter.idempotencyKey, "123e4567-e89b-42d3-a456-426614174000");
     const conflict = await invoke(routeStack("post", "/api/orders").at(-1), {
-      body: { ...savedPayload, items: [{ name: "Changed item", price: 10, qty: 1 }] },
+      body: { ...savedPayload, items: [{ _id: testProductId, name: "Changed item", price: 10, qty: 1 }] },
       headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(conflict.statusCode, 409);
   } finally {
     Order.prototype.save = originalSave;
     Order.findOne = originalFindOne;
+    Product.find = originalProductFind;
   }
 });
 
@@ -562,17 +1020,34 @@ test("public footer uses the exact business profiles with accessible external li
   assert.match(footer, /target="_blank" rel="noopener noreferrer" aria-label=/);
 });
 test("checkout clears cart only after a confirmed response and redirects to the dedicated confirmation page", async () => {
-  const browser = checkoutBrowser();
+  let submittedBody;
+  const browser = checkoutBrowser({ fetchImpl: async (_url, options) => {
+    submittedBody = JSON.parse(options.body);
+    return { ok: true, status: 201, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9", confirmationToken: "signed-test-token" }) };
+  } });
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), false);
   assert.equal(browser.window.location.href, "order-success.html");
   assert.ok(browser.sessionStorage.getItem("artcorner.order.confirmation"));
+  assert.deepEqual(submittedBody.items, [{ _id: "p1", qty: 1 }]);
+  assert.equal("price" in submittedBody.items[0], false);
+  assert.equal("name" in submittedBody.items[0], false);
 });
 test("checkout failure preserves cart and shows an error", async () => {
   const browser = checkoutBrowser({ fetchImpl: async () => ({ ok: false, json: async () => ({ error: "Order save failed" }) }) });
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.checkoutFeedback.textContent, /Order save failed/);
+});
+test("checkout sends WhatsApp consent only when the customer explicitly opts in", async () => {
+  let requestBody;
+  const browser = checkoutBrowser({ fetchImpl: async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return { ok: true, status: 201, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9", confirmationToken: "signed-test-token" }) };
+  } });
+  browser.nodes.whatsappOptIn.checked = true;
+  await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(requestBody.whatsappOptIn, true);
 });
 test("cart renders Cloudinary images, totals quantities, and persists quantity/removal controls", async () => {
   const browser = await cartBrowser({
@@ -740,6 +1215,13 @@ test("checkout rejects invalid customer details without sending or clearing the 
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.emailError.textContent, /valid email/i);
   assert.match(browser.nodes.checkoutFeedback.textContent, /highlighted details/i);
+
+  const invalidPhone = checkoutBrowser({ fetchImpl: async () => { requests++; throw new Error("should not submit"); } });
+  invalidPhone.nodes.phone.value = "1234567";
+  await invalidPhone.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(requests, 0);
+  assert.equal(invalidPhone.storage.has("cart"), true);
+  assert.match(invalidPhone.nodes.phoneError.textContent, /Indian mobile number/i);
 });
 test("checkout summary renders attacker-controlled cart names as text", () => {
   const payload = '<svg onload="alert(1)">';
@@ -773,6 +1255,10 @@ test("order public references have a unique partial index and retry reference co
   assert.equal(referenceIndex[1].unique, true);
   assert.deepEqual(referenceIndex[1].partialFilterExpression, { publicReference: { $type: "string" } });
   const originalSave = Order.prototype.save;
+  const originalProductFind = Product.find;
+  const originalOrderFindOne = Order.findOne;
+  Product.find = () => productFindResult([{ _id: testProductId, name: "Sample", price: 10, inStock: true }]);
+  Order.findOne = () => ({ select: async () => null });
   let attempts = 0;
   let firstReference;
   Order.prototype.save = async function () {
@@ -788,7 +1274,7 @@ test("order public references have a unique partial index and retry reference co
   };
   try {
     const response = await invoke(routeStack("post", "/api/orders").at(-1), {
-      body: { customer: { name: "A Customer" }, items: [{ name: "Sample", price: 10, qty: 1 }] },
+      body: validCheckoutBody([{ _id: testProductId, qty: 1 }]),
       headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" }
     });
     assert.equal(response.statusCode, 201);
@@ -796,6 +1282,8 @@ test("order public references have a unique partial index and retry reference co
     assert.notEqual(response.body.publicReference, firstReference);
   } finally {
     Order.prototype.save = originalSave;
+    Product.find = originalProductFind;
+    Order.findOne = originalOrderFindOne;
   }
 });
 
@@ -818,11 +1306,264 @@ test("order confirmation API requires a valid token and returns only a safe orde
     assert.equal(response.statusCode, 200);
     assert.deepEqual(filter, { publicReference: "AC-7K2P9" });
     assert.deepEqual(response.body, {
-      publicReference: "AC-7K2P9", status: "Placed", items: [{ name: "Candle", qty: 2, price: 100 }]
+      publicReference: "AC-7K2P9", status: "Placed", items: [{ name: "Candle", qty: 2, price: 100 }],
+      paymentStatus: null, paymentAmount: null, currency: null, upiPayment: null
     });
     assert.equal(JSON.stringify(response.body).includes("Private customer"), false);
+    assert.equal(JSON.stringify(response.body).includes("orderId"), false);
   } finally {
     Order.findOne = originalFindOne;
+  }
+});
+
+test("customer order lookup requires both identifiers, normalizes phone formats and returns only safe fields", async () => {
+  const originalFindOne = Order.findOne;
+  const appForLookup = createApp({ storefrontOrigin: "http://localhost:3000", whatsappEnv: { WHATSAPP_BUSINESS_RECIPIENT: "919380125087" }, upiEnv: {} });
+  const order = {
+    _id: "mongodb-internal-id", orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9",
+    customer: { name: "Customer", phone: "+91 98765 43210", email: "private@example.com", address: "Private delivery address" },
+    items: [{ productId: "64b64c0f1f1f1f1f1f1f1f1f", name: "Candle", qty: 2, price: 100, lineTotal: 200, image: "/uploads/candle.jpg" }],
+    subtotal: 200, total: 200, paymentAmount: 200, currency: "INR", paymentStatus: "Pending", paymentMethod: "UPI",
+    status: "Placed", createdAt: new Date("2026-10-01T10:00:00Z"), statusHistory: [{ status: "Placed", at: new Date("2026-10-01T10:00:00Z") }],
+    customerWhatsAppOptIn: true, paymentVerifiedBy: "secret-admin", paymentReference: "private-utr",
+    whatsappNotificationStatus: "sent", whatsappNotificationMessageId: "private-message", whatsappOutbox: [{ key: "private" }]
+  };
+  let capturedQuery;
+  Order.findOne = query => { capturedQuery = query; return { select() { return this; }, lean: async () => order }; };
+  try {
+    const handler = routeStack("post", "/api/order-lookup", appForLookup).at(-1);
+    const missing = await invoke(handler, { body: { orderReference: "AC-7K2P9" } });
+    assert.equal(missing.statusCode, 400);
+    const result = await invoke(handler, { body: { orderReference: "AC-7K2P9", phone: "(987) 654-3210", status: "Delivered", paymentStatus: "Paid" } });
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(capturedQuery, { publicReference: "AC-7K2P9" });
+    assert.equal(result.body.publicReference, "AC-7K2P9");
+    assert.equal(result.body.paymentStatus, "Pending");
+    assert.equal(order.paymentStatus, "Pending", "public input cannot update payment or fulfilment state");
+    assert.equal(result.body.status, "Placed");
+    assert.equal(result.body.items[0].image, "/uploads/candle.jpg");
+    assert.match(result.body.sharePaymentDetailsUrl, /^https:\/\/wa\.me\/919380125087/);
+    assert.match(result.body.contactWhatsAppUrl, /^https:\/\/wa\.me\/919380125087/);
+    const serialized = JSON.stringify(result.body);
+    for (const privateValue of ["mongodb-internal-id", "ORD-123e4567-e89b-42d3-a456-426614174000", "private@example.com", "Private delivery address", "secret-admin", "private-utr", "private-message", "whatsappOutbox", "+91 98765"]) {
+      assert.equal(serialized.includes(privateValue), false, `${privateValue} is not returned`);
+    }
+  } finally { Order.findOne = originalFindOne; }
+});
+
+test("customer order lookup uses one generic mismatch response and supports legacy timeline records", async () => {
+  const originalFindOne = Order.findOne;
+  const lookupApp = createApp({ storefrontOrigin: "http://localhost:3000", whatsappEnv: { WHATSAPP_BUSINESS_RECIPIENT: "919380125087" } });
+  let savedOrder = null;
+  Order.findOne = query => ({ select() { return this; }, lean: async () => query.publicReference
+    ? (savedOrder?.publicReference === query.publicReference ? savedOrder : null)
+    : (savedOrder?.orderId === query.orderId ? savedOrder : null) });
+  try {
+    const handler = routeStack("post", "/api/order-lookup", lookupApp).at(-1);
+    const wrongReference = await invoke(handler, { body: { orderReference: "AC-XXXXX", phone: "9876543210" } });
+    savedOrder = { orderId: "ORD-legacy", customer: { phone: "09876543210" }, items: [{ name: "Old order item", qty: 1, price: 75 }], status: "Delivered", createdAt: new Date("2025-01-01T10:00:00Z") };
+    const wrongPhone = await invoke(handler, { body: { orderReference: "ORD-legacy", phone: "9888888888" } });
+    const missingPayment = await invoke(handler, { body: { orderReference: "ORD-legacy", phone: "+91 98765 43210" } });
+    assert.equal(wrongReference.statusCode, 404);
+    assert.deepEqual(wrongReference.body, wrongPhone.body);
+    assert.equal(missingPayment.statusCode, 200);
+    assert.equal(missingPayment.body.publicReference, "ORD-legacy");
+    assert.equal(missingPayment.body.paymentStatus, null);
+    assert.equal(missingPayment.body.paymentAmount, null);
+    assert.equal(missingPayment.body.timeline.some(event => event.status === "Delivered" && event.at === null), true);
+    assert.equal(missingPayment.body.sharePaymentDetailsUrl, undefined, "payment-share link requires recorded opt-in");
+    assert.match(missingPayment.body.contactWhatsAppUrl, /^https:\/\/wa\.me\/919380125087/);
+    assert.equal(normalizeCustomerPhone("(987) 654-3210"), "919876543210");
+    assert.equal(normalizeCustomerPhone("+91 98765 43210"), "919876543210");
+    assert.equal(normalizeCustomerPhone("09876543210"), "919876543210");
+    assert.equal(normalizeCustomerPhone("0091 09876543210"), "919876543210");
+    assert.equal(normalizeCustomerPhone("123"), null);
+  } finally { Order.findOne = originalFindOne; }
+});
+
+test("legacy order timeline uses only recorded dates and states", () => {
+  const timeline = buildOrderTimeline({ status: "Shipped", createdAt: new Date("2025-01-01T00:00:00Z") });
+  assert.deepEqual(timeline, [
+    { type: "fulfilment", status: "Placed", at: "2025-01-01T00:00:00.000Z" },
+    { type: "fulfilment", status: "Shipped", at: null }
+  ]);
+});
+test("payment mismatch and cancellation timelines do not imply a completed delivery", () => {
+  const mismatch = buildOrderTimeline({
+    status: "Placed", paymentStatus: "Failed / Mismatch", createdAt: new Date("2025-01-01T00:00:00Z"),
+    statusHistory: [{ status: "Placed", at: new Date("2025-01-01T00:00:00Z") }]
+  });
+  assert.deepEqual(mismatch.map(event => event.status), ["Placed", "Failed / Mismatch"]);
+  assert.equal(mismatch.some(event => event.status === "Delivered"), false);
+  const cancelled = buildOrderTimeline({
+    status: "Cancelled", createdAt: new Date("2025-01-01T00:00:00Z"),
+    statusHistory: [{ status: "Placed", at: new Date("2025-01-01T00:00:00Z") }, { status: "Cancelled", at: new Date("2025-01-02T00:00:00Z") }]
+  });
+  assert.deepEqual(cancelled.map(event => event.status), ["Placed", "Cancelled"]);
+});
+
+test("customer order lookup applies separate phone-based and IP-based rate limits", async () => {
+  const originalFindOne = Order.findOne;
+  Order.findOne = () => ({ select() { return this; }, lean: async () => null });
+  try {
+    await withHttpApp(async ({ request }) => {
+      for (let i = 0; i < 5; i++) {
+        const response = await request("/api/order-lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ orderReference: "AC-7K2P9", phone: "9876543210" }) });
+        assert.equal(response.response.status, 404);
+      }
+      const limited = await request("/api/order-lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ orderReference: "AC-7K2P9", phone: "9876543210" }) });
+      assert.equal(limited.response.status, 429, "sixth lookup for the same normalized phone is rate limited");
+    });
+    await withHttpApp(async ({ request }) => {
+      for (let i = 0; i < 30; i++) {
+        const phone = String(9876540000 + i);
+        const response = await request("/api/order-lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ orderReference: "AC-7K2P9", phone }) });
+        assert.equal(response.response.status, 404);
+      }
+      const limited = await request("/api/order-lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ orderReference: "AC-7K2P9", phone: "9876540030" }) });
+      assert.equal(limited.response.status, 429, "31st request from one IP is rate limited despite distinct phone values");
+    });
+  } finally { Order.findOne = originalFindOne; }
+});
+
+test("UPI payment URI and QR use the trusted amount, encoded payee details, and public reference", async () => {
+  const order = { _id: "internal-only", orderId: "ORD-internal", publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 251.25 };
+  const urisSentToQr = [];
+  const payment = await createUpiPaymentDetails(order, {
+    env: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner & Crafts" },
+    qrCode: { toDataURL: async (uri, options) => {
+      urisSentToQr.push({ uri, options });
+      return "data:image/png;base64,cXJjb2Rl";
+    } }
+  });
+  const parsed = new URL(payment.uri);
+  assert.equal(parsed.protocol, "upi:");
+  assert.equal(parsed.hostname, "pay");
+  assert.equal(parsed.searchParams.get("pa"), "art.corner@bank");
+  assert.equal(parsed.searchParams.get("pn"), "Art Corner & Crafts");
+  assert.equal(parsed.searchParams.get("am"), "251.25");
+  assert.equal(parsed.searchParams.get("cu"), "INR");
+  assert.equal(parsed.searchParams.get("tn"), "AC-7K2P9");
+  assert.match(payment.uri, /pn=Art\+Corner\+%26\+Crafts/);
+  assert.equal(urisSentToQr[0].uri, payment.uri);
+  assert.equal(urisSentToQr[0].options.width, 280);
+  assert.equal(payment.qrCodeDataUrl, "data:image/png;base64,cXJjb2Rl");
+  assert.equal(JSON.stringify(payment).includes("internal-only"), false);
+  const realQr = await createUpiPaymentDetails(order, { env: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner & Crafts" } });
+  assert.match(realQr.qrCodeDataUrl, /^data:image\/png;base64,/);
+  assert.equal(await createUpiPaymentDetails(order, { env: {} }), null);
+  assert.equal(await createUpiPaymentDetails({ ...order, paymentStatus: undefined }, { env: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner" } }), null);
+  const qrFailure = await createUpiPaymentDetails(order, {
+    env: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner" },
+    qrCode: { toDataURL: async () => { throw new Error("private generator detail"); } }
+  });
+  assert.equal(qrFailure.uri, payment.uri.replace("Art+Corner+%26+Crafts", "Art+Corner"));
+  assert.equal(qrFailure.qrCodeDataUrl, null);
+});
+
+test("order confirmation returns server payment details only with its signed token and leaves payment Pending", async () => {
+  const originalFindOne = Order.findOne;
+  const savedOrder = {
+    _id: "private-db-id", orderId: "ORD-private", publicReference: "AC-7K2P9", status: "Placed",
+    paymentStatus: "Pending", paymentAmount: 375, currency: "INR", items: [{ name: "Candle", qty: 1, price: 375 }]
+  };
+  let qrUri;
+  let query;
+  Order.findOne = value => {
+    query = value;
+    return { select: () => ({ lean: async () => savedOrder }) };
+  };
+  const paymentApp = createApp({
+    sessionSecret: "signed-order-confirmation-test-secret",
+    storefrontOrigin: "http://localhost:3000",
+    upiEnv: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" },
+    qrCodeGenerator: { toDataURL: async uri => { qrUri = uri; return "data:image/png;base64,cXJjb2Rl"; } }
+  });
+  const handler = routeStack("get", "/api/order-confirmation", paymentApp).at(-1);
+  try {
+    const unauthorized = await invoke(handler, { headers: { "x-order-confirmation": "invalid" } });
+    assert.equal(unauthorized.statusCode, 401);
+    assert.equal(unauthorized.body.upiPayment, undefined);
+
+    const token = createOrderConfirmationToken("AC-7K2P9", "signed-order-confirmation-test-secret");
+    const confirmed = await invoke(handler, { headers: { "x-order-confirmation": token } });
+    assert.equal(confirmed.statusCode, 200);
+    assert.equal(query.publicReference, "AC-7K2P9");
+    assert.equal(confirmed.body.paymentStatus, "Pending");
+    assert.equal(confirmed.body.paymentAmount, 375);
+    assert.equal(confirmed.body.upiPayment.amount, 375);
+    assert.equal(confirmed.body.upiPayment.reference, "AC-7K2P9");
+    assert.equal(qrUri, confirmed.body.upiPayment.uri);
+    assert.equal(JSON.stringify(confirmed.body).includes("ORD-private"), false);
+    assert.equal(savedOrder.paymentStatus, "Pending", "reading payment instructions does not change payment status");
+  } finally {
+    Order.findOne = originalFindOne;
+  }
+});
+
+test("order success page shows UPI pending instructions, supports copying, and keeps a no-config fallback", async () => {
+  const env = { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" };
+  const trusted = await createUpiPaymentDetails({ publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 290 }, {
+    env, qrCode: { toDataURL: async () => "data:image/png;base64,cXJjb2Rl" }
+  });
+  let copied = "";
+  const browser = await orderSuccessBrowser({
+    responseBody: {
+      publicReference: "AC-7K2P9", status: "Placed", items: [{ name: "Resin tray", qty: 1, price: 290 }],
+      paymentStatus: "Pending", paymentAmount: 290, currency: "INR", upiPayment: trusted,
+      sharePaymentDetailsUrl: "https://wa.me/919380125087?text=Order%20AC-7K2P9"
+    },
+    clipboard: async value => { copied = value; }
+  });
+  assert.equal(browser.nodes.orderSuccessHeading.textContent, "Order received — payment pending");
+  assert.equal(browser.nodes.orderSuccessMark.textContent, "₹");
+  assert.equal(browser.nodes.upiPaymentAmount.textContent, "Amount to pay: ₹290.00 INR");
+  assert.equal(browser.nodes.upiPayButton.textContent, "Pay ₹290.00 using UPI");
+  assert.equal(browser.nodes.upiPayButton.href, trusted.uri);
+  assert.equal(browser.nodes.sharePaymentDetailsLink.href, "https://wa.me/919380125087?text=Order%20AC-7K2P9");
+  assert.equal(browser.nodes.sharePaymentDetailsLink.hidden, false);
+  assert.equal(browser.nodes.upiQrImage.src, trusted.qrCodeDataUrl);
+  assert.equal(browser.nodes.upiQrImage.hidden, true, "image remains hidden until browser confirms it loaded");
+  browser.nodes.upiQrImage.onload();
+  assert.equal(browser.nodes.upiQrImage.hidden, false);
+  await browser.nodes.copyUpiIdButton.handlers.click();
+  assert.equal(copied, "art.corner@bank");
+  assert.equal(browser.nodes.copyUpiIdButton.textContent, "UPI ID copied");
+  assert.equal(browser.fetchCalls.length, 1, "opening payment instructions does not submit another order");
+  assert.equal(browser.fetchCalls[0].url, "/api/order-confirmation");
+  assert.equal(browser.fetchCalls[0].options.method, undefined);
+  assert.equal(browser.nodes.orderSuccessCard.attributes["aria-busy"], "false");
+
+  const noConfig = await orderSuccessBrowser({ responseBody: {
+    publicReference: "AC-7K2P9", status: "Placed", items: [], paymentStatus: "Pending",
+    paymentAmount: 290, currency: "INR", upiPayment: null
+  } });
+  assert.equal(noConfig.nodes.upiPaymentPanel.hidden, false);
+  assert.equal(noConfig.nodes.upiPayButton.hidden, true);
+  assert.match(noConfig.nodes.upiPaymentUnavailable.textContent, /contact the store/i);
+  assert.equal(noConfig.nodes.orderSuccessHeading.textContent, "Order received — payment pending");
+
+  const legacy = await orderSuccessBrowser({ responseBody: { publicReference: "AC-7K2P9", status: "Placed", items: [] } });
+  assert.equal(legacy.nodes.upiPaymentPanel.hidden, true, "the payment panel remains hidden for legacy orders");
+  assert.match(legacy.nodes.orderSuccessMessage.textContent, /payment details are unavailable/i);
+});
+
+test("order success page clearly separates verification, paid, mismatch and refunded states", async () => {
+  const cases = [
+    ["Verification Pending", "Payment submitted — verification pending", /do not pay again/i],
+    ["Paid", "Payment verified — thank you!", /confirmed/i],
+    ["Failed / Mismatch", "Payment needs review", /before making another payment/i],
+    ["Refunded", "Payment refunded", /has been refunded/i]
+  ];
+  for (const [paymentStatus, heading, messagePattern] of cases) {
+    const browser = await orderSuccessBrowser({ responseBody: {
+      publicReference: "AC-7K2P9", status: "Placed", items: [], paymentStatus,
+      paymentAmount: 100, currency: "INR", upiPayment: null
+    } });
+    assert.equal(browser.nodes.orderSuccessHeading.textContent, heading, paymentStatus);
+    assert.match(browser.nodes.orderSuccessMessage.textContent, messagePattern, paymentStatus);
+    assert.equal(browser.nodes.upiPaymentPanel.hidden, true, `${paymentStatus} must not expose another-payment instructions`);
+    assert.equal(browser.nodes.upiPayButton.hidden, true, `${paymentStatus} must not offer a payment link`);
   }
 });
 
@@ -921,12 +1662,43 @@ test("HTTP login rejects incorrect credentials and oversized passwords", async (
 });
 test("HTTP admin APIs reject requests without an authenticated session", async () => {
   await withHttpApp(async ({ request }) => {
-    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/not-an-id"], ["PUT", "/api/products/not-an-id"], ["GET", "/api/orders"], ["PUT", "/api/orders/ORD-test"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"]]) {
+    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/not-an-id"], ["PUT", "/api/products/not-an-id"], ["GET", "/api/orders"], ["PUT", "/api/orders/ORD-test"], ["PUT", "/api/admin/orders/ORD-test/payment-verification"], ["POST", "/api/admin/orders/ORD-test/notifications/key/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"]]) {
       const result = await request(routePath, { method });
       assert.equal(result.response.status, 401, `${method} ${routePath}`);
       assert.match(result.text, /Authentication required/);
     }
   });
+});
+test("HTTP admin payment verification accepts a trusted authenticated session and updates once", async () => {
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const originalExists = Order.exists;
+  let updateCalls = 0;
+  let capturedUpdate;
+  Order.findOne = () => ({ select: async () => ({ customerWhatsAppOptIn: false, paymentStatus: "Pending" }) });
+  Order.findOneAndUpdate = async (_filter, update) => {
+    capturedUpdate = update;
+    updateCalls++;
+    return updateCalls === 1 ? { orderId: "ORD-http-test", paymentStatus: "Paid", status: "Preparing", paymentVerifiedAt: new Date(), paymentVerifiedBy: "test-admin" } : null;
+  };
+  Order.exists = async () => true;
+  try {
+    await withHttpApp(async ({ request }) => {
+      const login = await request("/api/admin/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: "test-admin", password: "test-only-password" }) });
+      const cookie = sessionCookie(login.setCookies);
+      const verify = () => request("/api/admin/orders/ORD-http-test/payment-verification", { method: "PUT", cookie, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "verify", paymentReference: "UTR-HTTP" }) });
+      const first = await verify();
+      assert.equal(first.response.status, 200);
+      assert.equal(JSON.parse(first.text).paymentStatus, "Paid");
+      assert.equal(capturedUpdate.$set.status, "Preparing");
+      const duplicate = await verify();
+      assert.equal(duplicate.response.status, 409);
+    });
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    Order.exists = originalExists;
+  }
 });
 test("unauthenticated multipart product upload is rejected before image processing", async () => {
   await withHttpApp(async ({ request }) => {
@@ -1044,7 +1816,7 @@ test("HTTP admin state changes reject untrusted and missing origins", async () =
       body: JSON.stringify({ username: "test-admin", password: "test-only-password" })
     });
     const cookie = sessionCookie(login.setCookies);
-    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/invalid"], ["PUT", "/api/products/invalid"], ["PUT", "/api/orders/ORD-test"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"], ["POST", "/api/admin/logout"]]) {
+    for (const [method, routePath] of [["POST", "/api/products"], ["DELETE", "/api/products/invalid"], ["PUT", "/api/products/invalid"], ["PUT", "/api/orders/ORD-test"], ["PUT", "/api/admin/orders/ORD-test/payment-verification"], ["POST", "/api/admin/orders/ORD-test/notifications/key/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/retry"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-sent"], ["POST", "/api/admin/orders/ORD-test/whatsapp-notification/confirm-not-sent-retry"], ["POST", "/api/admin/logout"]]) {
       const result = await request(routePath, { method, cookie, origin: "https://evil.storefront.example.test" });
       assert.equal(result.response.status, 403, `${method} ${routePath}`);
     }
@@ -1513,9 +2285,10 @@ test("admin order table treats public checkout fields as text, not markup", asyn
   const row = tbody.children[0];
   assert.deepEqual(row.children.slice(0, 3).map(cell => cell.textContent), [payload, payload, '" autofocus onfocus="alert(1)']);
   assert.equal(row.children[3].children[0].textContent, `${payload} (x1)`);
-  assert.equal(row.children[4].textContent, payload);
-  assert.equal(row.children[5].children[0].attributes["aria-label"], "Order status");
-  assert.equal(row.children[6].textContent, payload);
+  assert.equal(row.children[4].textContent, "Legacy — payment state unavailable");
+  assert.equal(row.children[5].textContent, payload);
+  assert.equal(row.children[6].children[0].attributes["aria-label"], `Fulfilment status for ${payload}`);
+  assert.equal(row.children[7].textContent, payload);
   assert.equal(row.innerHTML, "");
   assert.equal(row.children.some(cell => cell.children.some(child => child.tagName === "img" || child.tagName === "svg")), false);
 });
@@ -1537,12 +2310,62 @@ test("admin orders display the public reference and keep internal IDs for order 
 
   assert.equal(tbody.children[0].children[0].textContent, "AC-FHS7L");
   assert.equal(tbody.children[1].children[0].textContent, "Legacy: ORD-legacy-456");
-  const statusSelect = tbody.children[0].children[5].children[0];
+  const statusSelect = tbody.children[0].children[6].children[0];
   statusSelect.value = "Shipped";
   await statusSelect.handlers.change();
-  await tbody.children[0].children[6].children[0].handlers.click();
+  await tbody.children[0].children[7].children[0].handlers.click();
   assert.ok(requests.some(request => request.url === "/api/orders/ORD-internal-123" && request.method === "PUT"));
   assert.ok(requests.some(request => request.url === "/api/admin/orders/ORD-internal-123/whatsapp-notification/retry" && request.method === "POST"));
+});
+test("customer tracking page renders safe order details, payment state and an evidence-based timeline", async () => {
+  const ids = ["orderLookupForm", "orderLookupFeedback", "orderLookupButton", "orderLookupResult", "orderReferenceInput", "orderPhoneInput", "trackedOrderReference", "trackedOrderDate", "trackedPaymentStatus", "trackedFulfilmentStatus", "trackedPaymentPanel", "trackedPaymentMessage", "trackedAmountDue", "trackedQrStatus", "trackedQrImage", "trackedPayeeName", "trackedUpiId", "trackedPayButton", "trackedSharePayment", "trackedContactLink", "trackedOrderItems", "trackedOrderTotal", "trackedOrderTimeline", "trackedTimelineEmpty"];
+  const nodes = Object.fromEntries(ids.map(id => [id, uiElement(id)]));
+  nodes.orderLookupResult.hidden = true;
+  nodes.trackedPaymentPanel.hidden = true;
+  nodes.trackedQrImage.hidden = true;
+  nodes.trackedPayButton.hidden = true;
+  nodes.trackedSharePayment.hidden = true;
+  nodes.trackedContactLink.hidden = true;
+  nodes.orderReferenceInput.value = "AC-7K2P9";
+  nodes.orderPhoneInput.value = "9876543210";
+  const payment = await createUpiPaymentDetails({ publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 120 }, {
+    env: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner" }, qrCode: { toDataURL: async () => "data:image/png;base64,cXJjb2Rl" }
+  });
+  let lookupData = {
+    publicReference: "AC-7K2P9", orderDate: "2026-10-01T10:00:00.000Z", status: "Placed", paymentStatus: "Pending", paymentAmount: 120, total: 120, currency: "INR",
+    items: [{ name: '<img src=x onerror="alert(1)">', qty: 1, price: 120, lineTotal: 120, image: "/uploads/candle.jpg" }],
+    timeline: [{ type: "fulfilment", status: "Placed", at: "2026-10-01T10:00:00.000Z" }], upiPayment: payment,
+    sharePaymentDetailsUrl: "https://wa.me/919380125087?text=Pay", contactWhatsAppUrl: "https://wa.me/919380125087?text=Ask"
+  };
+  const browser = await runBrowserScript("public/track-order.js", {
+    nodes,
+    fetchImpl: async (_url, options) => {
+      assert.equal(JSON.parse(options.body).phone, "9876543210");
+      return { ok: true, json: async () => lookupData };
+    }
+  });
+  await nodes.orderLookupForm.handlers.submit({ preventDefault() {} });
+  assert.equal(nodes.orderLookupResult.hidden, false);
+  assert.equal(nodes.trackedOrderReference.textContent, "AC-7K2P9");
+  assert.equal(nodes.trackedPaymentStatus.textContent, "Pending");
+  assert.equal(nodes.trackedFulfilmentStatus.textContent, "Placed");
+  assert.equal(nodes.trackedPaymentPanel.hidden, false);
+  assert.equal(nodes.trackedPayButton.href, payment.uri);
+  assert.equal(nodes.trackedSharePayment.hidden, false);
+  assert.equal(nodes.trackedContactLink.hidden, false);
+  const item = nodes.trackedOrderItems.children[0];
+  assert.equal(item.children[1].children[0].textContent, '<img src=x onerror="alert(1)">');
+  assert.equal(item.innerHTML, "");
+  assert.equal(item.children[0].src, "/uploads/candle.jpg");
+  assert.equal(nodes.trackedOrderTimeline.children[0].children[1].dateTime, "2026-10-01T10:00:00.000Z");
+  assert.equal(nodes.trackedOrderTotal.textContent, "₹120.00 INR");
+  assert.equal(browser.window.location.href, "");
+  lookupData = { ...lookupData, paymentStatus: "Verification Pending", upiPayment: null };
+  await nodes.orderLookupForm.handlers.submit({ preventDefault() {} });
+  assert.equal(nodes.trackedPaymentPanel.hidden, false);
+  assert.match(nodes.trackedPaymentMessage.textContent, /do not pay again/i);
+  assert.equal(nodes.trackedPayButton.hidden, true);
+  assert.equal(nodes.trackedSharePayment.hidden, false, "opted-in customers may share their reference while verification is pending");
 });
 test("category management page lists and creates categories", async () => {
   const nodes = {

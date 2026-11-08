@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Track Your Order | Art Corner Bengaluru</title>
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+    <div id="navbar-container"></div>
+    <main class="page-container track-order-page">
+        <section class="track-order-intro">
+            <p class="home-eyebrow">ART CORNER BENGALURU</p>
+            <h1>Track Your Order</h1>
+            <p>Enter the order reference and the mobile number used at checkout to view your order progress.</p>
+        </section>
+
+        <form id="orderLookupForm" class="order-lookup-form" novalidate>
+            <label for="orderReferenceInput">Order reference or Order ID</label>
+            <input id="orderReferenceInput" name="orderReference" type="text" maxlength="100" autocomplete="off" required placeholder="For example, AC-ABCDE">
+            <label for="orderPhoneInput">Registered mobile number</label>
+            <input id="orderPhoneInput" name="phone" type="tel" inputmode="tel" autocomplete="tel" maxlength="32" required placeholder="Mobile number used at checkout">
+            <button id="orderLookupButton" class="primary-button" type="submit">Find My Order</button>
+        </form>
+        <p id="orderLookupFeedback" class="order-lookup-feedback" role="status" aria-live="polite"></p>
+
+        <section id="orderLookupResult" class="order-tracking-result" aria-live="polite" hidden>
+            <header class="tracking-order-header">
+                <div>
+                    <p class="home-eyebrow">YOUR ORDER</p>
+                    <h2 id="trackedOrderReference"></h2>
+                    <p id="trackedOrderDate"></p>
+                </div>
+                <div class="tracking-status-pills">
+                    <p><span>Payment</span><strong id="trackedPaymentStatus"></strong></p>
+                    <p><span>Fulfilment</span><strong id="trackedFulfilmentStatus"></strong></p>
+                </div>
+            </header>
+
+            <section id="trackedPaymentPanel" class="tracked-payment-panel" hidden>
+                <h3>Payment information</h3>
+                <p id="trackedPaymentMessage"></p>
+                <p id="trackedAmountDue"></p>
+                <div class="tracked-upi-layout">
+                    <div>
+                        <p id="trackedQrStatus" role="status" aria-live="polite"></p>
+                        <img id="trackedQrImage" alt="Order-specific UPI payment QR code" hidden>
+                    </div>
+                    <div>
+                        <p id="trackedPayeeName"></p>
+                        <p id="trackedUpiId"></p>
+                        <a id="trackedPayButton" class="primary-link-button" hidden>Pay using UPI</a>
+                        <a id="trackedSharePayment" class="secondary-link-button" hidden target="_blank" rel="noopener noreferrer">Share Payment Details on WhatsApp</a>
+                    </div>
+                </div>
+                <p class="tracked-manual-note">Payments are manually verified by Art Corner Bengaluru. This page cannot mark a payment as paid.</p>
+            </section>
+
+            <section class="tracked-items-section">
+                <h3>Items in this order</h3>
+                <div id="trackedOrderItems" class="tracked-order-items"></div>
+                <p class="tracked-order-total"><span>Order total</span><strong id="trackedOrderTotal"></strong></p>
+            </section>
+
+            <section class="tracked-timeline-section">
+                <h3>Order progress</h3>
+                <ol id="trackedOrderTimeline" class="tracked-order-timeline"></ol>
+                <p id="trackedTimelineEmpty" hidden>Tracking events are not available for this order yet.</p>
+            </section>
+
+            <a id="trackedContactLink" class="secondary-link-button tracked-contact-link" hidden target="_blank" rel="noopener noreferrer">Ask us about this order on WhatsApp</a>
+        </section>
+    </main>
+    <div id="footer-container"></div>
+    <script src="js/common.js"></script>
+    <script src="track-order.js"></script>
+</body>
+</html>

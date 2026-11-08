@@ -1,4 +1,20 @@
 function goBack() { window.history.back(); }
+function validCustomerPhone(value) {
+  if (typeof value !== "string" || value.length > 32) return false;
+  const input = value.trim();
+  if (!input || !/^\+?[0-9().\s-]+$/.test(input) || (input.includes("+") && !input.startsWith("+"))) return false;
+  let digits = input.replace(/\D/g, "");
+  const explicitInternational = input.startsWith("+") || digits.startsWith("00");
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  if (digits.startsWith("91") && digits.length > 10) {
+    digits = digits.slice(2);
+    if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+    return digits.length === 10 && /^[6-9]\d{9}$/.test(digits);
+  }
+  if (digits.length === 10) return /^[6-9]\d{9}$/.test(digits);
+  return (explicitInternational || digits.length >= 11) && /^[1-9]\d{7,14}$/.test(digits);
+}
 const form = document.getElementById("checkoutForm");
 const feedback = document.getElementById("checkoutFeedback");
 const orderIdFromUrl = new URLSearchParams(window.location.search).get("orderId");
@@ -68,7 +84,7 @@ if (validOrderId(orderIdFromUrl)) {
 } else {
   const fields = [
     { id: "name", message: "Enter your full name (at least 2 characters).", valid: value => value.trim().length >= 2 },
-    { id: "phone", message: "Enter a phone number using 7–20 digits or common phone symbols.", valid: value => /^[+0-9() .-]{7,20}$/.test(value.trim()) && /\d{7,}/.test(value) },
+    { id: "phone", message: "Enter a valid Indian mobile number, or an international number with its country code.", valid: validCustomerPhone },
     { id: "email", message: "Enter a valid email address.", valid: value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()) },
     { id: "address", message: "Enter a delivery address with at least 8 characters.", valid: value => value.trim().length >= 8 }
   ];
@@ -112,7 +128,10 @@ if (validOrderId(orderIdFromUrl)) {
         email: document.getElementById("email").value.trim(),
         address: document.getElementById("address").value.trim()
       },
-      items: currentCart
+      // Only send the product identity and requested quantity. The server loads
+      // current names, stock and prices before it creates the order snapshot.
+      items: currentCart.map(item => ({ _id: item._id, qty: item.qty })),
+      whatsappOptIn: document.getElementById("whatsappOptIn")?.checked === true
     };
     feedback.textContent = "Placing your order…";
     placeOrderButton.disabled = true;

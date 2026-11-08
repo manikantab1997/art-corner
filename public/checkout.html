@@ -44,6 +44,10 @@
           <textarea id="address" name="address" autocomplete="street-address" minlength="8" maxlength="500" required aria-describedby="addressError"></textarea>
           <small class="field-error" id="addressError"></small>
         </section>
+        <label class="whatsapp-opt-in" for="whatsappOptIn">
+          <input type="checkbox" id="whatsappOptIn" name="whatsappOptIn">
+          <span>Send me order and payment updates on WhatsApp (optional).</span>
+        </label>
         <button id="placeOrderButton" class="primary-button" type="submit">Place Order</button>
         <a class="checkout-back-link" href="cart.html">← Back to cart</a>
       </form>
@@ -52,7 +56,7 @@
         <h2 id="checkoutSummaryTitle">Order summary</h2>
         <div id="checkoutSummaryItems" class="checkout-summary-items"></div>
         <p class="checkout-summary-total"><span>Total</span><strong id="checkoutSummaryTotal">₹0.00</strong></p>
-        <p class="checkout-summary-note">No payment is taken on this page. The store will follow up about your order.</p>
+        <p class="checkout-summary-note">After placing your order, UPI payment instructions will appear. The store manually verifies each payment.</p>
       </aside>
     </div>
   </main>

@@ -891,6 +891,11 @@ button:focus-visible,
     color: #604b3b;
 }
 
+.primary-link-button[hidden],
+.secondary-link-button[hidden] {
+    display: none;
+}
+
 .primary-link-button:hover,
 .primary-link-button:focus-visible,
 .primary-button:hover,
@@ -1016,6 +1021,17 @@ button:focus-visible,
     outline: 3px solid rgba(145, 110, 77, .18);
 }
 
+.whatsapp-opt-in {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin: 14px 0;
+    color: #5f4a36;
+    line-height: 1.5;
+}
+
+.whatsapp-opt-in input { width: auto; margin: 4px 0 0; }
+
 .field-error {
     min-height: 1.1em;
     color: #9b3d2d;
@@ -1114,6 +1130,90 @@ button:focus-visible,
     border-radius: 14px;
     background: #f8f3eb;
     text-align: left;
+}
+
+.upi-payment-panel {
+    margin: 22px 0;
+    padding: clamp(18px, 4vw, 28px);
+    border: 1px solid #e7d8c5;
+    border-radius: 18px;
+    background: #fffaf1;
+    text-align: left;
+}
+
+.upi-payment-panel h2 {
+    margin-top: 0;
+    color: #49382c;
+    font-family: Georgia, 'Times New Roman', serif;
+}
+
+.upi-payment-amount {
+    color: #573d29;
+    font-size: 1.35rem;
+    font-weight: 750;
+}
+
+.upi-payment-layout {
+    display: grid;
+    grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+    gap: 22px;
+    align-items: center;
+    margin: 18px 0;
+}
+
+.upi-qr-card {
+    min-height: 220px;
+    display: grid;
+    place-items: center;
+    padding: 12px;
+    border: 1px solid #e9dfd1;
+    border-radius: 14px;
+    background: #fff;
+    text-align: center;
+}
+
+.upi-qr-card img {
+    display: block;
+    width: min(100%, 240px);
+    height: auto;
+    image-rendering: pixelated;
+}
+
+.upi-qr-card img[hidden] {
+    display: none;
+}
+
+.upi-payment-instructions {
+    display: grid;
+    justify-items: start;
+    gap: 10px;
+    min-width: 0;
+}
+
+.upi-payment-instructions p,
+.upi-payment-next-step,
+.upi-payment-manual-verification,
+.upi-app-help,
+.upi-payment-unavailable {
+    line-height: 1.6;
+}
+
+.upi-payment-instructions code {
+    overflow-wrap: anywhere;
+    color: #573d29;
+    font-weight: 700;
+}
+
+.upi-payment-manual-verification {
+    padding: 12px 14px;
+    border-left: 4px solid #b77b37;
+    background: #f6ecd9;
+    color: #49382c;
+    font-weight: 750;
+}
+
+.upi-payment-unavailable {
+    color: #7b422f;
 }
 
 .order-reference-label {
@@ -1353,6 +1453,14 @@ button:focus-visible,
         grid-template-columns: 1fr;
     }
 
+    .upi-payment-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .upi-qr-card {
+        min-height: 190px;
+    }
+
     .cart-item {
         grid-template-columns: 76px minmax(0, 1fr);
         gap: 12px;
@@ -1447,6 +1555,11 @@ button:focus-visible,
     width: 100%;
     margin: 0;
     box-sizing: border-box;
+}
+
+.checkout-form .whatsapp-opt-in input {
+    width: auto;
+    flex: 0 0 auto;
 }
 
 .checkout-form textarea {
@@ -1622,6 +1735,16 @@ button:focus-visible,
     background: white;
 }
 
+#ordersTable td input[type="text"] {
+    min-width: 180px;
+    margin: 8px 6px 4px 0;
+}
+
+#ordersTable td button {
+    margin: 4px 6px 4px 0;
+    white-space: normal;
+}
+
 @media (max-width: 768px) {
 
     #ordersTable {
@@ -1652,6 +1775,70 @@ button:focus-visible,
 .login-card h1 {
 
     margin-bottom: 25px;
+}
+
+.track-order-page { max-width: 980px; }
+.track-order-intro { max-width: 680px; margin: 20px auto 30px; text-align: center; }
+.track-order-intro h1 { margin: 8px 0; color: #553a2b; }
+.track-order-intro > p:last-child { color: #715b48; line-height: 1.65; }
+.order-lookup-form {
+    max-width: 560px;
+    margin: 0 auto 12px;
+    padding: clamp(20px, 4vw, 34px);
+    display: grid;
+    gap: 12px;
+    background: #fffaf1;
+    border: 1px solid rgba(115, 83, 53, .16);
+    border-radius: 20px;
+    box-shadow: 0 12px 35px rgba(71, 47, 30, .08);
+}
+.order-lookup-form label { color: #513b2c; font-weight: 650; }
+.order-lookup-form input { width: 100%; min-height: 48px; box-sizing: border-box; margin: 0; }
+.order-lookup-form button { width: 100%; margin-top: 8px; }
+.order-lookup-feedback { min-height: 1.5em; text-align: center; color: #6b4935; }
+.order-tracking-result {
+    margin: 30px auto;
+    padding: clamp(18px, 4vw, 34px);
+    background: #fffdf8;
+    border: 1px solid rgba(115, 83, 53, .16);
+    border-radius: 22px;
+    box-shadow: 0 16px 42px rgba(71, 47, 30, .08);
+}
+.tracking-order-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; padding-bottom: 22px; border-bottom: 1px solid #eadfce; }
+.tracking-order-header h2 { margin: 4px 0; overflow-wrap: anywhere; color: #553a2b; }
+.tracking-order-header p { color: #715b48; }
+.tracking-status-pills { display: grid; gap: 10px; min-width: min(100%, 240px); }
+.tracking-status-pills p { display: flex; justify-content: space-between; gap: 16px; margin: 0; padding: 10px 12px; border-radius: 10px; background: #f5eee2; }
+.tracking-status-pills strong { color: #573c2b; text-align: right; }
+.tracked-payment-panel, .tracked-items-section, .tracked-timeline-section { margin-top: 26px; padding: 20px; border-radius: 16px; background: #faf5eb; }
+.tracked-payment-panel h3, .tracked-items-section h3, .tracked-timeline-section h3 { margin: 0 0 14px; color: #553a2b; }
+.tracked-upi-layout { display: grid; grid-template-columns: minmax(160px, 220px) 1fr; align-items: center; gap: 24px; }
+.tracked-upi-layout img { display: block; width: min(100%, 210px); height: auto; background: white; border-radius: 12px; }
+.tracked-upi-layout > div:last-child { display: grid; justify-items: start; gap: 8px; }
+.tracked-upi-layout .primary-link-button, .tracked-upi-layout .secondary-link-button { margin: 0; }
+.tracked-manual-note { color: #6e5845; font-size: .95rem; }
+.tracked-order-items { display: grid; gap: 10px; }
+.tracked-order-item { display: flex; align-items: center; gap: 14px; padding: 12px; background: #fffdf9; border-radius: 12px; }
+.tracked-order-item img { width: 76px; height: 76px; flex: 0 0 76px; object-fit: cover; border-radius: 10px; }
+.tracked-order-item h4, .tracked-order-item p { margin: 0 0 5px; }
+.tracked-order-item > div { min-width: 0; }
+.tracked-order-item strong { color: #573c2b; }
+.tracked-order-total { display: flex; justify-content: space-between; gap: 16px; margin: 18px 0 0; padding-top: 14px; border-top: 1px solid #eadfce; font-size: 1.08rem; }
+.tracked-order-total strong { color: #573c2b; }
+.tracked-order-timeline { list-style: none; display: grid; gap: 0; margin: 0; padding: 0 0 0 12px; border-left: 2px solid #d6c2a8; }
+.tracking-event { position: relative; display: grid; gap: 5px; padding: 0 0 20px 18px; color: #523d2c; }
+.tracking-event::before { content: ""; position: absolute; left: -19px; top: 4px; width: 10px; height: 10px; background: #8b6849; border: 3px solid #fffdf8; border-radius: 50%; }
+.tracking-event time { color: #796652; font-size: .9rem; }
+.tracking-event.is-attention { color: #9b3d2d; }
+.tracking-event.is-attention::before { background: #a44e3a; }
+.tracked-contact-link { display: inline-flex; margin-top: 20px; }
+
+@media (max-width: 640px) {
+    .tracking-order-header { display: grid; }
+    .tracking-status-pills { width: 100%; }
+    .tracked-upi-layout { grid-template-columns: 1fr; }
+    .tracked-upi-layout > div:first-child { display: flex; align-items: center; gap: 12px; }
+    .tracked-order-item img { width: 64px; height: 64px; flex-basis: 64px; }
 }
 
 .login-card form {
