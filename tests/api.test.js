@@ -599,6 +599,13 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   const badgeLink = uiElement("a");
   const badge = uiElement("span");
   badge.closest = () => badgeLink;
+  const floatingBadge = uiElement("span");
+  const floatingCart = uiElement("a");
+  floatingBadge.closest = () => floatingCart;
+  floatingCart.href = "cart.html";
+  const backLink = uiElement("a");
+  const footer = uiElement("footer");
+  let footerObserver;
   const toggle = uiElement("button");
   const close = uiElement("button");
   const backdrop = uiElement("button");
@@ -617,18 +624,70 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   const windowHandlers = {};
   const document = {
     body: { classList: uiElement().classList }, activeElement: null,
-    querySelectorAll: () => [badge], addEventListener: (name, handler) => { keyHandlers[name] = handler; },
+    querySelectorAll: selector => selector === "[data-cart-count]" ? [badge, floatingBadge] : [],
+    querySelector: selector => selector === "[data-floating-cart]" ? floatingCart : selector === "#footer-container .footer" ? footer : null,
+    addEventListener: (name, handler) => { keyHandlers[name] = handler; },
     getElementById: () => null
   };
   const storage = new Map([["cart", JSON.stringify([{ qty: 2 }, { qty: 1 }])]]);
-  const window = { addEventListener: (name, handler) => { windowHandlers[name] = handler; }, dispatchEvent() {} };
+  const window = { location: { pathname: "/products.html" }, addEventListener: (name, handler) => { windowHandlers[name] = handler; }, dispatchEvent() {} };
   const source = fs.readFileSync(path.join(__dirname, "../public/js/common.js"), "utf8");
-  const context = vm.createContext({ document, window, localStorage: { getItem: key => storage.get(key) }, Event: class {}, fetch: async () => ({ ok: true, text: async () => "" }), console });
+  const context = vm.createContext({ document, window, localStorage: { getItem: key => storage.get(key) }, Event: class {},
+    IntersectionObserver: class { constructor(callback) { this.callback = callback; footerObserver = this; } observe(target) { this.target = target; } },
+    fetch: async () => ({ ok: true, text: async () => "" }), console });
   vm.runInContext(source, context);
   context.updateCartBadges();
   assert.equal(badge.textContent, "3");
   assert.equal(badge.hidden, false);
   assert.equal(badgeLink.attributes["aria-label"], "Cart, 3 items");
+  assert.equal(floatingBadge.textContent, "3");
+  assert.equal(floatingCart.hidden, false);
+  assert.equal(floatingCart.attributes["aria-label"], "Cart, 3 items");
+  storage.set("cart", JSON.stringify([{ qty: 1 }]));
+  context.announceCartUpdated();
+  assert.equal(floatingBadge.textContent, "1");
+  storage.set("cart", JSON.stringify([{ qty: 2 }]));
+  context.announceCartUpdated();
+  assert.equal(floatingBadge.textContent, "2");
+  assert.equal(floatingCart.href, "cart.html", "floating cart navigates to the existing cart page");
+  storage.set("cart", "[]");
+  windowHandlers.storage({ key: "cart" });
+  assert.equal(floatingCart.hidden, true, "floating cart hides when the shared cart is empty");
+  storage.set("cart", JSON.stringify([{ qty: 1 }]));
+  window.location.pathname = "/products.html";
+  context.updateCartBadges();
+  context.observeFooterForFloatingCart();
+  assert.equal(footerObserver.target, footer);
+  footerObserver.callback([{ isIntersecting: true }]);
+  assert.equal(floatingCart.hidden, true, "floating cart hides while the footer is visible");
+  footerObserver.callback([{ isIntersecting: false }]);
+  assert.equal(floatingCart.hidden, false, "floating cart returns after the footer leaves view");
+  window.location.pathname = "/cart.html";
+  context.updateCartBadges();
+  assert.equal(floatingCart.hidden, true, "floating cart stays out of the way on the cart page");
+  window.location.pathname = "/checkout.html";
+  context.updateCartBadges();
+  assert.equal(floatingCart.hidden, true, "floating cart stays out of the way on checkout");
+  window.location.pathname = "/admin.html";
+  context.updateCartBadges();
+  assert.equal(floatingCart.hidden, true, "floating cart stays out of the way in admin pages");
+
+  const contextualRoot = { querySelector: selector => selector === "[data-contextual-back]" ? backLink : null };
+  window.location.pathname = "/product.html";
+  context.setupContextualBackLink(contextualRoot);
+  assert.equal(backLink.href, "products.html");
+  assert.equal(backLink.textContent, "← Back to products");
+  window.location.pathname = "/cart.html";
+  context.setupContextualBackLink(contextualRoot);
+  assert.equal(backLink.href, "products.html");
+  assert.equal(backLink.textContent, "← Continue shopping");
+  window.location.pathname = "/checkout.html";
+  context.setupContextualBackLink(contextualRoot);
+  assert.equal(backLink.href, "cart.html");
+  assert.equal(backLink.textContent, "← Back to cart");
+  window.location.pathname = "/index.html";
+  context.setupContextualBackLink(contextualRoot);
+  assert.equal(backLink.hidden, true, "homepage has no contextual back link");
   context.setupMobileNavigation(root);
   toggle.handlers.click();
   assert.equal(toggle.attributes["aria-expanded"], "true");
@@ -640,6 +699,16 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   assert.equal(toggle.attributes["aria-expanded"], "false");
   assert.equal(backdrop.hidden, true);
   assert.equal(typeof windowHandlers.storage, "function");
+});
+test("bottom navigation markup and its reserved page spacing are removed", () => {
+  const htmlFiles = fs.readdirSync(path.join(__dirname, "../public")).filter(file => file.endsWith(".html"));
+  for (const file of htmlFiles) {
+    const html = fs.readFileSync(path.join(__dirname, "../public", file), "utf8");
+    assert.doesNotMatch(html, /class=["']bottom-nav["']/i, `${file} has no bottom navigation`);
+  }
+  const css = fs.readFileSync(path.join(__dirname, "../public/style.css"), "utf8");
+  assert.doesNotMatch(css, /\.bottom-nav\b/);
+  assert.doesNotMatch(css, /body\s*\{[^}]*padding-bottom:\s*70px/i);
 });
 test("checkout reuses its idempotency key after a failed request and clears it only on confirmed success", async () => {
   let postedKey;

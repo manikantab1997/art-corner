@@ -1,4 +1,5 @@
 const cartUpdatedEventName = "artcorner:cart-updated";
+let floatingCartFooterVisible = false;
 
 function getCartQuantity() {
     try {
@@ -20,6 +21,44 @@ function updateCartBadges() {
         const link = badge.closest("a");
         if (link) link.setAttribute("aria-label", `Cart, ${quantity} ${quantity === 1 ? "item" : "items"}`);
     });
+    const floatingCart = document.querySelector("[data-floating-cart]");
+    if (floatingCart) {
+        const page = (window.location.pathname || "").split("/").pop().toLowerCase();
+        const cartControlsOnPage = page === "cart.html" || page === "checkout.html";
+        const adminPage = ["admin.html", "dashboard.html", "orders.html", "categories.html"].includes(page);
+        floatingCart.hidden = quantity === 0 || cartControlsOnPage || adminPage || floatingCartFooterVisible;
+        floatingCart.setAttribute("aria-label", `Cart, ${quantity} ${quantity === 1 ? "item" : "items"}`);
+    }
+}
+
+function setupContextualBackLink(root) {
+    const backLink = root.querySelector("[data-contextual-back]");
+    if (!backLink) return;
+    const page = (window.location.pathname || "").split("/").pop().toLowerCase();
+    const destinations = {
+        "product.html": ["products.html", "← Back to products"],
+        "cart.html": ["products.html", "← Continue shopping"],
+        "checkout.html": ["cart.html", "← Back to cart"]
+    };
+    const destination = destinations[page];
+    if (!destination) {
+        backLink.hidden = true;
+        return;
+    }
+    backLink.href = destination[0];
+    backLink.textContent = destination[1];
+    backLink.hidden = false;
+    backLink.setAttribute("aria-label", destination[1].replace(/^←\s*/, ""));
+}
+
+function observeFooterForFloatingCart() {
+    const footer = document.querySelector("#footer-container .footer");
+    if (!footer || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(entries => {
+        floatingCartFooterVisible = entries.some(entry => entry.isIntersecting);
+        updateCartBadges();
+    }, { threshold: 0.01 });
+    observer.observe(footer);
 }
 
 function announceCartUpdated() {
@@ -130,6 +169,7 @@ async function loadNavbar() {
         const response = await fetch("components/navbar.html");
         if (!response.ok) throw new Error("Navigation could not be loaded.");
         navbarContainer.innerHTML = await response.text();
+        setupContextualBackLink(navbarContainer);
         const isAdmin = await getAdminSession();
         document.querySelectorAll("[data-nav-dashboard]").forEach(link => { link.hidden = !isAdmin; });
         document.querySelectorAll("[data-nav-logout]").forEach(link => { link.hidden = !isAdmin; });
@@ -152,6 +192,7 @@ async function loadFooter() {
         const response = await fetch("/components/footer.html");
         if (!response.ok) throw new Error("Footer could not be loaded.");
         footerContainer.innerHTML = await response.text();
+        observeFooterForFloatingCart();
     } catch (error) {
         console.error("Footer request failed:", error);
     }

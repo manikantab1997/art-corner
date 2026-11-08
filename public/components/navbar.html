@@ -1,6 +1,6 @@
 <nav class="navbar" aria-label="Main navigation">
     <div class="nav-left">
-        <button class="back-btn" type="button" onclick="history.back()" aria-label="Go back">← Back</button>
+        <a class="back-btn" data-contextual-back hidden></a>
         <a href="index.html" class="logo" aria-label="Art Corner Bengaluru home">
             <img src="images/art-corner-logo-transparent.png" alt="Art Corner Bengaluru">
         </a>
@@ -24,6 +24,15 @@
         </button>
     </div>
 </nav>
+
+<a href="cart.html" class="floating-cart" data-floating-cart hidden aria-label="Cart, 0 items">
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M3 4h2l2.1 10.1a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 1.9-1.4L21 8H6" />
+        <circle cx="10" cy="20" r="1" />
+        <circle cx="18" cy="20" r="1" />
+    </svg>
+    <span class="floating-cart-count cart-badge" data-cart-count aria-hidden="true" hidden>0</span>
+</a>
 
 <button id="mobileMenuBackdrop" class="mobile-menu-backdrop" type="button" aria-label="Close navigation menu" tabindex="-1" hidden></button>
 <aside id="mobileMenu" class="mobile-menu" role="dialog" aria-modal="true" aria-labelledby="mobileMenuTitle" aria-hidden="true" inert>
