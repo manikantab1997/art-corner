@@ -2606,13 +2606,25 @@ test("homepage keeps useful API failure and empty states without inventing produ
 });
 
 test("public brand labels and generated WhatsApp payment messages use Art Corner BLR", () => {
-  const brandedFiles = [
-    "index.html", "cart.html", "checkout.html", "product.html", "products.html", "order-success.html",
-    "track-order.html", "orders.html", "admin.html", "dashboard.html", "categories.html", "login.html"
-  ];
-  brandedFiles.forEach(file => {
+  const expectedTitles = {
+    "index.html": "Art Corner Blr",
+    "cart.html": "Cart | Art Corner Blr",
+    "checkout.html": "Checkout | Art Corner Blr",
+    "product.html": "Product Details | Art Corner Blr",
+    "products.html": "Products | Art Corner Blr",
+    "order-success.html": "Order Confirmation | Art Corner Blr",
+    "track-order.html": "Track Order | Art Corner Blr",
+    "orders.html": "Order Management | Art Corner Blr",
+    "admin.html": "Admin Panel | Art Corner Blr",
+    "dashboard.html": "Admin Dashboard | Art Corner Blr",
+    "categories.html": "Category Management | Art Corner Blr",
+    "login.html": "Admin Login | Art Corner Blr"
+  };
+  Object.entries(expectedTitles).forEach(([file, expectedTitle]) => {
     const html = fs.readFileSync(path.join(__dirname, "../public", file), "utf8");
-    assert.match(html, /Art Corner BLR/, `${file} title uses the current brand`);
+    const titleTags = html.match(/<title\b[\s\S]*?<\/title>/gi) || [];
+    assert.equal(titleTags.length, 1, `${file} has exactly one title tag`);
+    assert.equal(titleTags[0].replace(/<\/?title>/gi, "").trim(), expectedTitle, `${file} has the requested title`);
     assert.doesNotMatch(html, /Art Corner Bengaluru/);
   });
   const navbar = fs.readFileSync(path.join(__dirname, "../public/components/navbar.html"), "utf8");
