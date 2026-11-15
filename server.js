@@ -145,6 +145,13 @@ const orderSchema = new mongoose.Schema({
     orderId: String,
     publicReference: { type: String, default: undefined },
     customer: { name: String, phone: String, email: String, address: String },
+    deliveryAddress: {
+        addressLine1: String,
+        addressLine2: String,
+        city: String,
+        state: String,
+        pinCode: String
+    },
     items: Array,
     subtotal: { type: Number, min: 0 },
     total: { type: Number, min: 0 },
@@ -1135,10 +1142,30 @@ function createApp({
             email: typeof customerInput.email === "string" ? customerInput.email.trim() : "",
             address: typeof customerInput.address === "string" ? customerInput.address.trim() : ""
         };
+        const addressInput = body?.deliveryAddress;
+        const deliveryAddress = {
+            addressLine1: typeof addressInput?.addressLine1 === "string" ? addressInput.addressLine1.trim() : "",
+            addressLine2: typeof addressInput?.addressLine2 === "string" ? addressInput.addressLine2.trim() : "",
+            city: typeof addressInput?.city === "string" ? addressInput.city.trim() : "",
+            state: typeof addressInput?.state === "string" ? addressInput.state.trim() : "",
+            pinCode: typeof addressInput?.pinCode === "string" ? addressInput.pinCode.trim() : ""
+        };
+        const addressFieldErrors = {};
+        if (deliveryAddress.addressLine1.length < 5 || deliveryAddress.addressLine1.length > 200) addressFieldErrors.addressLine1 = "Address Line 1 must contain between 5 and 200 characters.";
+        if (addressInput?.addressLine2 !== undefined && typeof addressInput.addressLine2 !== "string") addressFieldErrors.addressLine2 = "Address Line 2 must be text.";
+        if (deliveryAddress.addressLine2.length > 200) addressFieldErrors.addressLine2 = "Address Line 2 must be 200 characters or fewer.";
+        if (!deliveryAddress.city || deliveryAddress.city.length > 100) addressFieldErrors.city = "Enter a city or town (up to 100 characters).";
+        if (!deliveryAddress.state || deliveryAddress.state.length > 100) addressFieldErrors.state = "Enter a state (up to 100 characters).";
+        if (!/^\d{6}$/.test(deliveryAddress.pinCode)) addressFieldErrors.pinCode = "PIN Code must contain exactly 6 numeric digits.";
+        if (Object.keys(addressFieldErrors).length) {
+            return res.status(400).json({ error: "Please correct the highlighted delivery address fields.", fieldErrors: addressFieldErrors });
+        }
+        // Keep a joined legacy value for older internal integrations while new
+        // orders also retain each address component separately.
+        customer.address = [deliveryAddress.addressLine1, deliveryAddress.addressLine2, deliveryAddress.city, deliveryAddress.state, deliveryAddress.pinCode].filter(Boolean).join(", ");
         if (customer.name.length < 2 || customer.name.length > 160 ||
             !customer.phone ||
-            customer.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email) ||
-            customer.address.length < 8 || customer.address.length > 500) {
+            customer.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email)) {
             return res.status(400).json({ error: "Customer name, phone number (Indian mobile or international with country code), email, or delivery address is invalid" });
         }
         if (body?.whatsappOptIn !== undefined && typeof body.whatsappOptIn !== "boolean") {
@@ -1224,7 +1251,7 @@ function createApp({
             const customerWhatsAppOptIn = body.whatsappOptIn === true;
             const orderPlacedAt = new Date();
             const newOrder = new Order({
-                orderId, publicReference: generatePublicOrderReference(), customer, items: orderItems,
+                orderId, publicReference: generatePublicOrderReference(), customer, deliveryAddress, items: orderItems,
                 subtotal: total, total, currency: "INR", paymentStatus: "Pending", paymentAmount: total,
                 status: "Placed", createdAt: orderPlacedAt, statusHistory: [{ status: "Placed", at: orderPlacedAt }], idempotencyKey, requestHash,
                 whatsappNotificationStatus: initialNotificationStatus,

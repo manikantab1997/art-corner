@@ -86,7 +86,10 @@ if (validOrderId(orderIdFromUrl)) {
     { id: "name", message: "Enter your full name (at least 2 characters).", valid: value => value.trim().length >= 2 },
     { id: "phone", message: "Enter a valid Indian mobile number, or an international number with its country code.", valid: validCustomerPhone },
     { id: "email", message: "Enter a valid email address.", valid: value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()) },
-    { id: "address", message: "Enter a delivery address with at least 8 characters.", valid: value => value.trim().length >= 8 }
+    { id: "addressLine1", message: "Enter Address Line 1 (at least 5 characters).", valid: value => value.trim().length >= 5 },
+    { id: "city", message: "Enter your city or town.", valid: value => value.trim().length > 0 },
+    { id: "state", message: "Enter your state.", valid: value => value.trim().length > 0 },
+    { id: "pinCode", message: "Enter a 6-digit numeric PIN code.", valid: value => /^\d{6}$/.test(value.trim()) }
   ];
   fields.forEach(field => {
     const input = document.getElementById(field.id);
@@ -126,12 +129,18 @@ if (validOrderId(orderIdFromUrl)) {
         name: document.getElementById("name").value.trim(),
         phone: document.getElementById("phone").value.trim(),
         email: document.getElementById("email").value.trim(),
-        address: document.getElementById("address").value.trim()
+        address: ["addressLine1", "addressLine2", "city", "state", "pinCode"].map(id => document.getElementById(id).value.trim()).filter(Boolean).join(", ")
+      },
+      deliveryAddress: {
+        addressLine1: document.getElementById("addressLine1").value.trim(),
+        addressLine2: document.getElementById("addressLine2").value.trim(),
+        city: document.getElementById("city").value.trim(),
+        state: document.getElementById("state").value.trim(),
+        pinCode: document.getElementById("pinCode").value.trim()
       },
       // Only send the product identity and requested quantity. The server loads
       // current names, stock and prices before it creates the order snapshot.
-      items: currentCart.map(item => ({ _id: item._id, qty: item.qty })),
-      whatsappOptIn: document.getElementById("whatsappOptIn")?.checked === true
+      items: currentCart.map(item => ({ _id: item._id, qty: item.qty }))
     };
     feedback.textContent = "Placing your order…";
     placeOrderButton.disabled = true;
@@ -144,6 +153,16 @@ if (validOrderId(orderIdFromUrl)) {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (data.fieldErrors && typeof data.fieldErrors === "object") {
+          Object.entries(data.fieldErrors).forEach(([fieldId, message]) => {
+            const input = document.getElementById(fieldId);
+            const error = document.getElementById(`${fieldId}Error`);
+            if (!input || !error || typeof message !== "string") return;
+            error.textContent = message;
+            input.setCustomValidity(message);
+          });
+          throw new Error(data.error || "Please correct the highlighted delivery address fields.");
+        }
         if (response.status === 409 && /checkout key was already used/i.test(data.error || "")) {
           sessionStorage.removeItem(checkoutKeyName);
           throw new Error("Your checkout details changed since the previous attempt. Review them and place the order again.");

@@ -279,8 +279,22 @@ function renderOrderDetails(order) {
   addDetailLine(customerSection, "Name", customer.name);
   addDetailLine(customerSection, "Phone", customer.phone);
   addDetailLine(customerSection, "Email", customer.email);
-  addDetailLine(customerSection, "Delivery address", customer.address);
   detailsContent.appendChild(customerSection);
+
+  const address = order.deliveryAddress || {};
+  const deliverySection = createSection("Delivery address", "order-detail-delivery-address");
+  if (address.addressLine1 || address.city || address.state || address.pinCode) {
+    addDetailLine(deliverySection, "Address Line 1", address.addressLine1);
+    if (address.addressLine2) addDetailLine(deliverySection, "Address Line 2", address.addressLine2);
+    addDetailLine(deliverySection, "City / Town", address.city);
+    addDetailLine(deliverySection, "State", address.state);
+    addDetailLine(deliverySection, "PIN Code", address.pinCode);
+  } else if (customer.address) {
+    addDetailLine(deliverySection, "Legacy address", customer.address);
+  } else {
+    addDetailLine(deliverySection, "Address", "Not provided on this legacy order");
+  }
+  detailsContent.appendChild(deliverySection);
 
   const summarySection = createSection("Order summary", "order-detail-meta");
   addDetailLine(summarySection, "Order date", formatDate(order.createdAt || order.orderDate));

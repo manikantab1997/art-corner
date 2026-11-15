@@ -62,6 +62,7 @@ const testSessionSecret = "integration-test-session-secret-with-more-than-32-cha
 const testProductId = "64b64c0f1f1f1f1f1f1f1f1f";
 const validCheckoutBody = (items = [{ _id: testProductId, qty: 2, name: "Client name", price: 1 }]) => ({
   customer: { name: "A Customer", phone: "9876543210", email: "customer@example.com", address: "Bengaluru delivery address" },
+  deliveryAddress: { addressLine1: "12 Market Street", addressLine2: "Near Lake", city: "Bengaluru", state: "Karnataka", pinCode: "560001" },
   items
 });
 const productFindResult = products => ({
@@ -274,9 +275,13 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", pri
     name: { value: "A Customer", addEventListener() {}, setCustomValidity() {}, focus() {} },
     phone: { value: "9876543210", addEventListener() {}, setCustomValidity() {}, focus() {} },
     email: { value: "customer@example.com", addEventListener() {}, setCustomValidity() {}, focus() {} },
-    whatsappOptIn: { checked: false },
-    address: { value: "Bengaluru delivery address", addEventListener() {}, setCustomValidity() {}, focus() {} },
-    nameError: { textContent: "" }, phoneError: { textContent: "" }, emailError: { textContent: "" }, addressError: { textContent: "" }
+    addressLine1: { value: "12 Market Street", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    addressLine2: { value: "Near Lake", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    city: { value: "Bengaluru", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    state: { value: "Karnataka", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    pinCode: { value: "560001", addEventListener() {}, setCustomValidity() {}, focus() {} },
+    nameError: { textContent: "" }, phoneError: { textContent: "" }, emailError: { textContent: "" },
+    addressLine1Error: { textContent: "" }, addressLine2Error: { textContent: "" }, cityError: { textContent: "" }, stateError: { textContent: "" }, pinCodeError: { textContent: "" }
   };
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" } };
   const localStorage = {
@@ -459,6 +464,7 @@ test("POST /api/orders returns a persisted order ID in a success response", asyn
   Order.prototype.save = async function () { savedOrder = this; return this; };
   try {
     const submittedBody = validCheckoutBody();
+    submittedBody.deliveryAddress = { addressLine1: "  12 Market Street  ", addressLine2: "  ", city: " Bengaluru ", state: " Karnataka ", pinCode: "560001" };
     submittedBody.customer.isAdmin = true;
     submittedBody.total = 0;
     submittedBody.paymentStatus = "Paid";
@@ -479,6 +485,8 @@ test("POST /api/orders returns a persisted order ID in a success response", asyn
     assert.equal(savedOrder.paymentStatus, "Pending");
     assert.equal(savedOrder.status, "Placed");
     assert.equal(savedOrder.customer.phone, "919876543210", "new orders store the canonical phone number");
+    assert.deepEqual(savedOrder.deliveryAddress.toObject(), { addressLine1: "12 Market Street", addressLine2: "", city: "Bengaluru", state: "Karnataka", pinCode: "560001" });
+    assert.equal(savedOrder.customer.address, "12 Market Street, Bengaluru, Karnataka, 560001", "legacy address summary is derived from validated structured fields");
     assert.equal(savedOrder.customerWhatsAppOptIn, false);
     assert.deepEqual(savedOrder.whatsappOutbox, []);
     assert.equal(savedOrder.customer.isAdmin, undefined);
@@ -490,6 +498,23 @@ test("POST /api/orders returns a persisted order ID in a success response", asyn
     Order.prototype.save = originalSave;
     Product.find = originalProductFind;
     Order.findOne = originalOrderFindOne;
+  }
+});
+
+test("checkout independently validates required structured delivery address fields", async () => {
+  const handler = routeStack("post", "/api/orders").at(-1);
+  const invalidAddresses = [
+    [{ addressLine1: "", city: "Bengaluru", state: "Karnataka", pinCode: "560001" }, "addressLine1"],
+    [{ addressLine1: "1234", city: "Bengaluru", state: "Karnataka", pinCode: "560001" }, "addressLine1"],
+    [{ addressLine1: "12 Market Street", city: "  ", state: "Karnataka", pinCode: "560001" }, "city"],
+    [{ addressLine1: "12 Market Street", city: "Bengaluru", state: " ", pinCode: "560001" }, "state"],
+    ...["", "12345", "1234567", "12A456"].map(pinCode => [{ addressLine1: "12 Market Street", city: "Bengaluru", state: "Karnataka", pinCode }, "pinCode"])
+  ];
+  for (const [deliveryAddress, field] of invalidAddresses) {
+    const body = { ...validCheckoutBody(), deliveryAddress };
+    const response = await invoke(handler, { body, headers: { "idempotency-key": "123e4567-e89b-42d3-a456-426614174000" } });
+    assert.equal(response.statusCode, 400, `${field} should be rejected`);
+    assert.equal(typeof response.body.fieldErrors[field], "string", `${field} should have a specific error`);
   }
 });
 
@@ -1195,6 +1220,7 @@ test("checkout clears cart only after a confirmed response and redirects to the 
   assert.deepEqual(browser.soundCalls, ["order"], "the optional order sound is attempted only after success and valid references");
   assert.ok(browser.sessionStorage.getItem("artcorner.order.confirmation"));
   assert.deepEqual(submittedBody.items, [{ _id: "p1", qty: 1 }]);
+  assert.deepEqual(submittedBody.deliveryAddress, { addressLine1: "12 Market Street", addressLine2: "Near Lake", city: "Bengaluru", state: "Karnataka", pinCode: "560001" });
   assert.equal("price" in submittedBody.items[0], false);
   assert.equal("name" in submittedBody.items[0], false);
 });
@@ -1205,15 +1231,17 @@ test("checkout failure preserves cart and shows an error", async () => {
   assert.match(browser.nodes.checkoutFeedback.textContent, /Order save failed/);
   assert.deepEqual(browser.soundCalls, [], "failed requests do not trigger the order sound");
 });
-test("checkout sends WhatsApp consent only when the customer explicitly opts in", async () => {
+test("checkout does not show or submit the unavailable customer WhatsApp opt-in", async () => {
   let requestBody;
   const browser = checkoutBrowser({ fetchImpl: async (_url, options) => {
     requestBody = JSON.parse(options.body);
     return { ok: true, status: 201, json: async () => ({ orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9", confirmationToken: "signed-test-token" }) };
   } });
-  browser.nodes.whatsappOptIn.checked = true;
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
-  assert.equal(requestBody.whatsappOptIn, true);
+  const checkoutHtml = fs.readFileSync(path.join(__dirname, "../public/checkout.html"), "utf8");
+  assert.doesNotMatch(checkoutHtml, /whatsappOptIn|Send me order and payment updates/i);
+  assert.equal("whatsappOptIn" in requestBody, false);
+  assert.equal(browser.window.location.href, "order-success.html", "checkout continues normally without the opt-in");
 });
 test("cart renders Cloudinary images, totals quantities, and persists quantity/removal controls", async () => {
   const browser = await cartBrowser({
@@ -1525,6 +1553,26 @@ test("checkout rejects invalid customer details without sending or clearing the 
   assert.equal(invalidPhone.storage.has("cart"), true);
   assert.match(invalidPhone.nodes.phoneError.textContent, /Indian mobile number/i);
 });
+
+test("checkout blocks invalid address fields and displays server field errors without clearing entered values", async () => {
+  let requests = 0;
+  const browser = checkoutBrowser({ fetchImpl: async () => {
+    requests++;
+    return { ok: false, status: 400, json: async () => ({ error: "Please correct the highlighted delivery address fields.", fieldErrors: { pinCode: "PIN Code must contain exactly 6 numeric digits." } }) };
+  } });
+  browser.nodes.pinCode.value = "5600A1";
+  await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(requests, 0, "invalid PIN is blocked before the API request");
+  assert.match(browser.nodes.pinCodeError.textContent, /6-digit numeric PIN/i);
+  assert.equal(browser.nodes.pinCode.value, "5600A1");
+
+  browser.nodes.pinCode.value = "560001";
+  await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
+  assert.equal(requests, 1);
+  assert.match(browser.nodes.pinCodeError.textContent, /exactly 6 numeric digits/i);
+  assert.equal(browser.nodes.pinCode.value, "560001", "server validation failure preserves the entered value");
+  assert.ok(browser.storage.has("cart"), "failed validation preserves the cart");
+});
 test("checkout summary renders attacker-controlled cart names as text", () => {
   const payload = '<svg onload="alert(1)">';
   const browser = checkoutBrowser({ cart: [{ _id: "p1", name: payload, price: 25, qty: 1 }] });
@@ -1624,6 +1672,7 @@ test("customer order lookup requires both identifiers, normalizes phone formats 
   const order = {
     _id: "mongodb-internal-id", orderId: "ORD-123e4567-e89b-42d3-a456-426614174000", publicReference: "AC-7K2P9",
     customer: { name: "Customer", phone: "+91 98765 43210", email: "private@example.com", address: "Private delivery address" },
+    deliveryAddress: { addressLine1: "Private structured street", addressLine2: "", city: "Bengaluru", state: "Karnataka", pinCode: "560001" },
     items: [{ productId: "64b64c0f1f1f1f1f1f1f1f1f", name: "Candle", qty: 2, price: 100, lineTotal: 200, image: "/uploads/candle.jpg" }],
     subtotal: 200, total: 200, paymentAmount: 200, currency: "INR", paymentStatus: "Pending", paymentMethod: "UPI",
     status: "Placed", createdAt: new Date("2026-10-01T10:00:00Z"), statusHistory: [{ status: "Placed", at: new Date("2026-10-01T10:00:00Z") }],
@@ -1647,7 +1696,7 @@ test("customer order lookup requires both identifiers, normalizes phone formats 
     assert.match(result.body.sharePaymentDetailsUrl, /^https:\/\/wa\.me\/919380125087/);
     assert.match(result.body.contactWhatsAppUrl, /^https:\/\/wa\.me\/919380125087/);
     const serialized = JSON.stringify(result.body);
-    for (const privateValue of ["mongodb-internal-id", "ORD-123e4567-e89b-42d3-a456-426614174000", "private@example.com", "Private delivery address", "secret-admin", "private-utr", "private-message", "whatsappOutbox", "+91 98765"]) {
+    for (const privateValue of ["mongodb-internal-id", "ORD-123e4567-e89b-42d3-a456-426614174000", "private@example.com", "Private delivery address", "Private structured street", "560001", "secret-admin", "private-utr", "private-message", "whatsappOutbox", "+91 98765"]) {
       assert.equal(serialized.includes(privateValue), false, `${privateValue} is not returned`);
     }
   } finally { Order.findOne = originalFindOne; }
@@ -2880,6 +2929,7 @@ test("admin order list and details safely render order data and reject unsafe pr
   assert.equal(detailNodes.find(node => node.tagName === "img").src, "/uploads/candle.jpg");
   assert.ok(detailNodes.every(node => !node.innerHTML));
   assert.equal(detailNodes.some(node => node.attributes.onclick), false);
+  assert.ok(detailNodes.some(node => node.textContent === "Legacy address"), "legacy orders still display their stored free-text address");
 });
 
 test("admin orders responsive styles keep table scrolling contained and switch to cards at 430px", () => {
@@ -2897,6 +2947,7 @@ test("admin order details open on mobile cards and keep internal IDs for verifie
   const order = {
     orderId: "ORD-internal-123", publicReference: "AC-FHS7L", status: "Placed", createdAt: "2026-11-08T09:00:00.000Z",
     customer: { name: "Mani First", phone: "+91 91903 690865", email: "mani@example.test", address: "Bengaluru" },
+    deliveryAddress: { addressLine1: "12 Garden Road", addressLine2: "Near Park", city: "Bengaluru", state: "Karnataka", pinCode: "560001" },
     items: [{ name: "Bracelet", qty: 1, price: 99, lineTotal: 99 }],
     total: 99, paymentAmount: 99, currency: "INR", paymentStatus: "Pending", paymentMethod: "UPI",
     whatsappNotificationStatus: "failed", customerWhatsAppOptIn: true,
@@ -2922,6 +2973,10 @@ test("admin order details open on mobile cards and keep internal IDs for verifie
   await nodes.ordersCards.children[0].handlers.click();
   assert.equal(nodes.orderDetailsView.hidden, false);
   assert.equal(browser.document.body.classList.contains("order-details-open"), true);
+  const initialDetails = flattenUi(nodes.orderDetailsContent);
+  for (const value of ["Delivery address", "Address Line 1", "12 Garden Road", "Address Line 2", "Near Park", "City / Town", "Bengaluru", "State", "Karnataka", "PIN Code", "560001"]) {
+    assert.ok(initialDetails.some(node => node.textContent === value), `admin details show ${value}`);
+  }
 
   let controls = flattenUi(nodes.orderDetailsContent);
   const utr = controls.find(node => node.tagName === "input");

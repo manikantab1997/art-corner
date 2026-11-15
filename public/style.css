@@ -1034,6 +1034,12 @@ button:focus-visible,
     font-weight: 650;
 }
 
+.optional-field-label {
+    color: #827466;
+    font-size: .88em;
+    font-weight: 400;
+}
+
 .checkout-field-group input,
 .checkout-field-group textarea {
     width: 100%;
@@ -2217,6 +2223,23 @@ button:focus-visible,
 
 .order-detail-customer .order-detail-line:last-child .order-detail-value {
     max-width: 72%;
+}
+
+.order-detail-delivery-address .order-detail-line {
+    display: grid;
+    grid-template-columns: minmax(105px, .35fr) minmax(0, 1fr);
+    gap: 8px 14px;
+}
+
+.order-detail-delivery-address {
+    grid-column: 1 / -1;
+}
+
+.order-detail-delivery-address .order-detail-value {
+    max-width: none;
+    text-align: left;
+    overflow-wrap: anywhere;
+    user-select: text;
 }
 
 .order-product-line {

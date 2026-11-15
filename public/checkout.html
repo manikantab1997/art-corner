@@ -40,14 +40,26 @@
 
         <section class="checkout-field-group" aria-labelledby="deliveryDetailsTitle">
           <h2 id="deliveryDetailsTitle">Delivery details</h2>
-          <label for="address">Delivery address</label>
-          <textarea id="address" name="address" autocomplete="street-address" minlength="8" maxlength="500" required aria-describedby="addressError"></textarea>
-          <small class="field-error" id="addressError"></small>
+          <label for="addressLine1">Address Line 1</label>
+          <input type="text" id="addressLine1" name="addressLine1" autocomplete="address-line1" placeholder="Flat / House No., Building, Street, Area" minlength="5" maxlength="200" required aria-describedby="addressLine1Error">
+          <small class="field-error" id="addressLine1Error"></small>
+
+          <label for="addressLine2">Address Line 2 <span class="optional-field-label">(optional)</span></label>
+          <input type="text" id="addressLine2" name="addressLine2" autocomplete="address-line2" placeholder="Apartment, Landmark (optional)" maxlength="200" aria-describedby="addressLine2Error">
+          <small class="field-error" id="addressLine2Error"></small>
+
+          <label for="city">City / Town</label>
+          <input type="text" id="city" name="city" autocomplete="address-level2" placeholder="Enter your city" maxlength="100" required aria-describedby="cityError">
+          <small class="field-error" id="cityError"></small>
+
+          <label for="state">State</label>
+          <input type="text" id="state" name="state" autocomplete="address-level1" placeholder="Enter your state" maxlength="100" required aria-describedby="stateError">
+          <small class="field-error" id="stateError"></small>
+
+          <label for="pinCode">PIN Code</label>
+          <input type="text" id="pinCode" name="pinCode" autocomplete="postal-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit PIN code" required aria-describedby="pinCodeError">
+          <small class="field-error" id="pinCodeError"></small>
         </section>
-        <label class="whatsapp-opt-in" for="whatsappOptIn">
-          <input type="checkbox" id="whatsappOptIn" name="whatsappOptIn">
-          <span>Send me order and payment updates on WhatsApp (optional).</span>
-        </label>
         <button id="placeOrderButton" class="primary-button" type="submit">Place Order</button>
         <a class="checkout-back-link" href="cart.html">← Back to cart</a>
       </form>
