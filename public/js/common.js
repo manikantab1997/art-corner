@@ -187,6 +187,7 @@ function playShopSound(kind = "cart") {
 function setupContextualBackLink(root) {
     const backLink = root.querySelector("[data-contextual-back]");
     if (!backLink) return;
+    const navbar = root.querySelector(".navbar");
     const page = (window.location.pathname || "").split("/").pop().toLowerCase();
     const destinations = {
         "product.html": ["products.html", "← Back to products"],
@@ -196,12 +197,14 @@ function setupContextualBackLink(root) {
     const destination = destinations[page];
     if (!destination) {
         backLink.hidden = true;
+        navbar?.classList.remove("navbar-has-contextual-back");
         return;
     }
     backLink.href = destination[0];
     backLink.textContent = destination[1];
     backLink.hidden = false;
     backLink.setAttribute("aria-label", destination[1].replace(/^←\s*/, ""));
+    navbar?.classList.add("navbar-has-contextual-back");
 }
 
 function observeFooterForFloatingCart() {

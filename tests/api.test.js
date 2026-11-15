@@ -1246,6 +1246,8 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   floatingBadge.closest = () => floatingCart;
   floatingCart.href = "cart.html";
   const backLink = uiElement("a");
+  backLink.hidden = true;
+  const navbar = uiElement("nav");
   const footer = uiElement("footer");
   let footerObserver;
   const toggle = uiElement("button");
@@ -1260,6 +1262,7 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   finalLink.href = "login.html";
   menu.querySelectorAll = selector => selector.includes("a[href]") ? [homeLink, finalLink] : [homeLink, finalLink, close];
   const root = { querySelector: selector => ({
+    "[data-contextual-back]": backLink, ".navbar": navbar,
     "#mobileMenuToggle": toggle, "#mobileMenu": menu, "#mobileMenuClose": close, "#mobileMenuBackdrop": backdrop
   })[selector] || null };
   const keyHandlers = {};
@@ -1285,6 +1288,14 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   assert.equal(floatingBadge.textContent, "3");
   assert.equal(floatingCart.hidden, false);
   assert.equal(floatingCart.attributes["aria-label"], "Cart, 3 items");
+  window.location.pathname = "/cart.html";
+  context.setupContextualBackLink(root);
+  assert.equal(backLink.href, "products.html");
+  assert.equal(backLink.textContent, "← Continue shopping");
+  assert.equal(navbar.classList.contains("navbar-has-contextual-back"), true);
+  window.location.pathname = "/products.html";
+  context.setupContextualBackLink(root);
+  assert.equal(navbar.classList.contains("navbar-has-contextual-back"), false);
   storage.set("cart", JSON.stringify([{ qty: 1 }]));
   context.announceCartUpdated();
   assert.equal(floatingBadge.textContent, "1");
@@ -2559,8 +2570,17 @@ test("public brand labels and generated WhatsApp payment messages use Art Corner
   const navbar = fs.readFileSync(path.join(__dirname, "../public/components/navbar.html"), "utf8");
   const footer = fs.readFileSync(path.join(__dirname, "../public/components/footer.html"), "utf8");
   assert.match(navbar, /Art Corner BLR/);
+  assert.equal((navbar.match(/class="nav-brand"/g) || []).length, 1, "the shared navbar has one visible brand link");
+  assert.match(navbar, /<a href="index\.html" class="nav-brand" aria-label="Art Corner BLR home">Art Corner BLR<\/a>/);
+  assert.match(navbar, /<a href="index\.html" class="logo" aria-label="Art Corner BLR home">/);
   assert.match(footer, /Art Corner BLR/);
   assert.doesNotMatch(`${navbar}${footer}`, /Art Corner Bengaluru/);
+  const styles = fs.readFileSync(path.join(__dirname, "../public/style.css"), "utf8");
+  assert.match(styles, /\.nav-brand\s*\{[^}]*left:\s*50%/s, "brand is centered in the navbar");
+  assert.match(styles, /@media\s*\(min-width:\s*761px\)\s*and\s*\(max-width:\s*1240px\)/,
+    "tablet widths reserve a second row for desktop navigation links");
+  assert.match(styles, /\.navbar\.navbar-has-contextual-back \.nav-brand/,
+    "narrow contextual-back pages reserve space for the existing back link");
 });
 
 test("product page uses fetched category names and still renders products if category loading fails", async () => {
