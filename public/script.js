@@ -119,19 +119,30 @@ function makeCategoryCard({ name, href, product, index, allProducts = false }) {
   const visual = document.createElement("span");
   visual.className = "category-card-visual";
   visual.setAttribute("aria-hidden", "true");
-  const art = document.createElement("span");
-  art.className = "category-card-art";
-  visual.appendChild(art);
+  if (allProducts) {
+    const icon = document.createElement("span");
+    icon.className = "all-products-icon";
+    for (let cell = 0; cell < 4; cell += 1) {
+      const iconCell = document.createElement("span");
+      iconCell.className = "all-products-icon-cell";
+      icon.appendChild(iconCell);
+    }
+    visual.appendChild(icon);
+  } else {
+    const art = document.createElement("span");
+    art.className = "category-card-art";
+    visual.appendChild(art);
 
-  const imageSource = getProductImageSource(product);
-  if (imageSource) {
-    const image = document.createElement("img");
-    image.alt = "";
-    image.loading = "lazy";
-    image.hidden = true;
-    image.addEventListener("load", () => { image.hidden = false; });
-    image.src = imageSource;
-    visual.appendChild(image);
+    const imageSource = getProductImageSource(product);
+    if (imageSource) {
+      const image = document.createElement("img");
+      image.alt = "";
+      image.loading = "lazy";
+      image.hidden = true;
+      image.addEventListener("load", () => { image.hidden = false; });
+      image.src = imageSource;
+      visual.appendChild(image);
+    }
   }
 
   const copy = document.createElement("span");
@@ -141,8 +152,14 @@ function makeCategoryCard({ name, href, product, index, allProducts = false }) {
   title.textContent = name;
   const action = document.createElement("span");
   action.className = "category-card-action";
-  action.textContent = allProducts ? "Discover the full collection" : "Explore collection";
+  action.textContent = allProducts ? "Browse our full collection" : "Explore collection";
   copy.append(title, action);
+  if (allProducts) {
+    const explore = document.createElement("span");
+    explore.className = "category-card-explore";
+    explore.textContent = "Explore →";
+    copy.appendChild(explore);
+  }
   card.append(visual, copy);
   return card;
 }

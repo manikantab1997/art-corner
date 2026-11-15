@@ -290,11 +290,13 @@ function checkoutBrowser({ search = "", cart = [{ _id: "p1", name: "Sample", pri
     setItem: (key, value) => storage.set(key, value),
     removeItem: key => storage.delete(key)
   };
+  const soundCalls = [];
   vm.runInNewContext(source, {
     document, window, localStorage, sessionStorage, fetch: fetchImpl, console, URLSearchParams,
-    crypto: { randomUUID: () => "123e4567-e89b-42d3-a456-426614174000" }
+    crypto: { randomUUID: () => "123e4567-e89b-42d3-a456-426614174000" },
+    playShopSound: kind => soundCalls.push(kind)
   });
-  return { nodes, window, storage, sessionStorage };
+  return { nodes, window, storage, sessionStorage, soundCalls };
 }
 async function orderSuccessBrowser({ responseBody, clipboard = async () => {} }) {
   const ids = [
@@ -313,6 +315,8 @@ async function orderSuccessBrowser({ responseBody, clipboard = async () => {} })
   const document = { getElementById: id => nodes[id] || null, createElement: tag => uiElement(tag) };
   const fetchCalls = [];
   const source = fs.readFileSync(path.join(__dirname, "../public/order-success.js"), "utf8");
+  nodes.orderPlacedCelebration = uiElement("div");
+  nodes.orderPlacedCelebration.hidden = true;
   vm.runInNewContext(source, {
     document, sessionStorage, URL,
     fetch: async (url, options) => {
@@ -335,10 +339,12 @@ async function cartBrowser({ cart = [], products = [{ _id: "p1", inStock: true }
   };
   const window = { history: { back() {} }, addEventListener: (name, callback) => { listeners[name] = callback; }, dispatchEvent() {} };
   const document = { getElementById: id => nodes[id], createElement: tag => uiElement(tag) };
+  const toastMessages = [];
   const source = fs.readFileSync(path.join(__dirname, "../public/cart.js"), "utf8");
-  vm.runInNewContext(source, { document, window, localStorage, fetch: async () => ({ ok: true, json: async () => products }), console, URL });
+  vm.runInNewContext(source, { document, window, localStorage, fetch: async () => ({ ok: true, json: async () => products }), console, URL,
+    showShopToast: message => toastMessages.push(message) });
   await new Promise(resolve => setTimeout(resolve, 0));
-  return { nodes, storage, listeners };
+  return { nodes, storage, listeners, toastMessages };
 }
 function uiElement(tagName = "div") {
   return {
@@ -375,7 +381,7 @@ function uiElement(tagName = "div") {
     querySelectorAll() { return this.children.flatMap(child => [child, ...(child.querySelectorAll ? child.querySelectorAll("") : [])]); }
   };
 }
-async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, alertImpl = () => {}, stored = {} } = {}) {
+async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, alertImpl = () => {}, stored = {}, shopFunctions = {} } = {}) {
   const storage = new Map(Object.entries(stored));
   const localStorage = { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) };
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" }, addEventListener() {}, dispatchEvent() {} };
@@ -393,7 +399,7 @@ async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fet
   vm.runInNewContext(source, {
     document, window: { ...window, confirm: confirmImpl }, localStorage, fetch: fetchImpl, console, URLSearchParams,
     URL, encodeURIComponent, requireAdminPage, confirm: confirmImpl, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
-    FormData: class { append() {} }, alert: alertImpl
+    FormData: class { append() {} }, alert: alertImpl, ...shopFunctions
   });
   await new Promise(resolve => setTimeout(resolve, 0));
   return { window, nodes, storage, document };
@@ -1186,6 +1192,7 @@ test("checkout clears cart only after a confirmed response and redirects to the 
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), false);
   assert.equal(browser.window.location.href, "order-success.html");
+  assert.deepEqual(browser.soundCalls, ["order"], "the optional order sound is attempted only after success and valid references");
   assert.ok(browser.sessionStorage.getItem("artcorner.order.confirmation"));
   assert.deepEqual(submittedBody.items, [{ _id: "p1", qty: 1 }]);
   assert.equal("price" in submittedBody.items[0], false);
@@ -1196,6 +1203,7 @@ test("checkout failure preserves cart and shows an error", async () => {
   await browser.nodes.checkoutForm.onsubmit({ preventDefault() {} });
   assert.equal(browser.storage.has("cart"), true);
   assert.match(browser.nodes.checkoutFeedback.textContent, /Order save failed/);
+  assert.deepEqual(browser.soundCalls, [], "failed requests do not trigger the order sound");
 });
 test("checkout sends WhatsApp consent only when the customer explicitly opts in", async () => {
   let requestBody;
@@ -1221,6 +1229,7 @@ test("cart renders Cloudinary images, totals quantities, and persists quantity/r
   browser.nodes.cart.children[0].children[2].children[2].handlers.click();
   assert.deepEqual(JSON.parse(browser.storage.get("cart")), []);
   assert.equal(browser.nodes.cart.children[0].className, "cart-empty-state");
+  assert.deepEqual(browser.toastMessages, ["Removed from cart."]);
 });
 test("cart shows an empty state and keeps checkout hidden when empty", async () => {
   const browser = await cartBrowser({ cart: [] });
@@ -1279,6 +1288,7 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   storage.set("cart", JSON.stringify([{ qty: 1 }]));
   context.announceCartUpdated();
   assert.equal(floatingBadge.textContent, "1");
+  assert.equal(floatingBadge.classList.contains("cart-count-bounce"), true, "a changed cart count gets a brief visual bounce");
   storage.set("cart", JSON.stringify([{ qty: 2 }]));
   context.announceCartUpdated();
   assert.equal(floatingBadge.textContent, "2");
@@ -1332,6 +1342,81 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   assert.equal(toggle.attributes["aria-expanded"], "false");
   assert.equal(backdrop.hidden, true);
   assert.equal(typeof windowHandlers.storage, "function");
+});
+test("shop toasts announce, dismiss and sound preferences stay off until enabled by the customer", () => {
+  const appended = [];
+  const storage = new Map();
+  const timers = new Map();
+  let nextTimer = 0;
+  let audioContexts = 0;
+  class FakeAudioContext {
+    constructor() { audioContexts += 1; this.currentTime = 0; this.destination = {}; this.state = "running"; }
+    createOscillator() { return { frequency: { setValueAtTime() {} }, connect() {}, start() {}, stop() {} }; }
+    createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; }
+    close() { return Promise.resolve(); }
+  }
+  const document = {
+    body: { appendChild(node) { appended.push(node); } },
+    getElementById: () => null,
+    createElement: tag => uiElement(tag),
+    querySelectorAll: () => [], querySelector: () => null,
+    addEventListener() {}
+  };
+  const window = { location: { pathname: "/products.html" }, AudioContext: FakeAudioContext,
+    addEventListener() {}, dispatchEvent() {}, requestAnimationFrame(callback) { callback(); } };
+  const source = fs.readFileSync(path.join(__dirname, "../public/js/common.js"), "utf8");
+  const context = vm.createContext({
+    document, window,
+    localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    Event: class {}, console,
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { delay, callback: () => { timers.delete(id); callback(); } }); return id; },
+    clearTimeout(id) { timers.delete(id); }
+  });
+  vm.runInContext(source, context);
+  assert.equal(context.areShopSoundsEnabled(), false, "sound defaults off");
+  assert.equal(audioContexts, 0, "loading the page does not start audio");
+
+  const product = { _id: "p1", name: "Handmade Candle", price: 20, inStock: true };
+  const addButton = uiElement("button");
+  context.addCartItemFromClick(product, addButton);
+  assert.equal(JSON.parse(storage.get("cart")).length, 1);
+  assert.equal(JSON.parse(storage.get("cart"))[0].qty, 1, "one add action writes one cart quantity");
+  assert.equal(addButton.textContent, "Added to cart");
+  assert.equal(addButton.disabled, true, "the button briefly locks to absorb an accidental double click");
+  assert.equal(audioContexts, 0, "disabled sound does not play on an add action");
+  context.addCartItemFromClick(product, addButton);
+  assert.equal(JSON.parse(storage.get("cart"))[0].qty, 1, "a second click during processing cannot duplicate the add");
+  const unlockFirst = [...timers.values()].find(timer => timer.delay === 180);
+  unlockFirst.callback();
+  assert.equal(addButton.disabled, false);
+  const toast = appended[0];
+  assert.equal(toast.textContent, "Handmade Candle added to cart!");
+  assert.equal(toast.getAttribute("role"), "status");
+  assert.equal(toast.getAttribute("aria-live"), "polite");
+  const dismiss = [...timers.entries()].find(([, timer]) => timer.delay === 3000);
+  assert.ok(dismiss, "toast schedules automatic dismissal");
+  dismiss[1].callback();
+  assert.equal(toast.classList.contains("shop-toast-visible"), false);
+  const hide = [...timers.entries()].find(([, timer]) => timer.delay === 220);
+  hide[1].callback();
+  assert.equal(toast.hidden, true);
+
+  const toggle = uiElement("button");
+  const root = { querySelectorAll: () => [toggle] };
+  context.setupShopSoundToggles(root);
+  assert.equal(toggle.textContent, "Sound off");
+  assert.equal(toggle.attributes["aria-pressed"], "false");
+  toggle.handlers.click();
+  assert.equal(storage.get("artcorner.sound-enabled"), "true", "sound preference persists locally");
+  assert.equal(toggle.attributes["aria-pressed"], "true");
+  context.addCartItemFromClick(product, addButton);
+  assert.equal(JSON.parse(storage.get("cart"))[0].qty, 2);
+  assert.equal(audioContexts, 1, "sound is generated only in response to the add interaction after opt-in");
+  [...timers.values()].find(timer => timer.delay === 180).callback();
+  toggle.handlers.click();
+  context.addCartItemFromClick(product, addButton);
+  assert.equal(JSON.parse(storage.get("cart"))[0].qty, 3);
+  assert.equal(audioContexts, 1, "turning sound off prevents further playback");
 });
 test("bottom navigation markup and its reserved page spacing are removed", () => {
   const htmlFiles = fs.readdirSync(path.join(__dirname, "../public")).filter(file => file.endsWith(".html"));
@@ -1680,6 +1765,11 @@ test("order success page shows UPI pending instructions, supports copying, and k
     clipboard: async value => { copied = value; }
   });
   assert.equal(browser.nodes.orderSuccessHeading.textContent, "Order received — payment pending");
+  assert.equal(browser.nodes.orderPlacedCelebration.hidden, false, "the server-verified order reveals the placement celebration");
+  assert.equal(browser.nodes.orderSuccessCard.classList.contains("order-placed-celebration-active"), true);
+  const confirmationHtml = fs.readFileSync(path.join(__dirname, "../public/order-success.html"), "utf8");
+  assert.match(confirmationHtml, /Your order has been placed!/);
+  assert.match(confirmationHtml, /href="track-order\.html">Track Order/);
   assert.equal(browser.nodes.orderSuccessMark.textContent, "₹");
   assert.equal(browser.nodes.upiPaymentAmount.textContent, "Amount to pay: ₹290.00 INR");
   assert.equal(browser.nodes.upiPayButton.textContent, "Pay ₹290.00 using UPI");
@@ -1712,6 +1802,12 @@ test("order success page shows UPI pending instructions, supports copying, and k
   const legacy = await orderSuccessBrowser({ responseBody: { publicReference: "AC-7K2P9", status: "Placed", items: [] } });
   assert.equal(legacy.nodes.upiPaymentPanel.hidden, true, "the payment panel remains hidden for legacy orders");
   assert.match(legacy.nodes.orderSuccessMessage.textContent, /payment details are unavailable/i);
+});
+test("order success celebration stays hidden when the server reference is invalid", async () => {
+  const browser = await orderSuccessBrowser({ responseBody: { publicReference: "not-a-reference", status: "Placed", items: [] } });
+  assert.equal(browser.nodes.orderPlacedCelebration.hidden, true);
+  assert.equal(browser.nodes.orderSuccessCard.classList.contains("order-placed-celebration-active"), false);
+  assert.match(browser.nodes.orderSuccessHeading.textContent, /couldn't verify/i);
 });
 
 test("order success page clearly separates verification, paid, mismatch and refunded states", async () => {
@@ -2245,9 +2341,9 @@ test("admin product listing requires session and trusted origin, then includes o
 test("homepage uses dynamic categories and only the curated homepage product response", async () => {
   const html = fs.readFileSync(path.join(__dirname, "../public/index.html"), "utf8");
   assert.match(html, /class="home-hero"/);
-  assert.match(html, /View All Products/);
+  assert.doesNotMatch(html, /View All Products/);
   assert.doesNotMatch(html, /Featured Products|id="featured-products"/);
-  assert.equal((html.match(/View All Products/g) || []).length, 1);
+  assert.equal((html.match(/All Products/g) || []).length, 0, "the collection card is created dynamically rather than duplicated in markup");
 
   const categories = [{ id: 1, name: "Candles" }, { id: 4, name: "Pottery" }];
   const products = [
@@ -2271,6 +2367,12 @@ test("homepage uses dynamic categories and only the curated homepage product res
   });
   assert.equal(success.nodes.categories.children.length, 3, "All Products plus API categories render");
   assert.deepEqual(success.nodes.categories.children.map(card => card.children[1].children[0].textContent), ["All Products", "Candles", "Pottery"]);
+  const allProductsCard = success.nodes.categories.children[0];
+  assert.equal(allProductsCard.href, "products.html");
+  assert.equal(allProductsCard.children[0].children.some(child => child.tagName === "img"), false, "All Products uses an icon, not a product photograph");
+  assert.equal(allProductsCard.children[0].children[0].className, "all-products-icon");
+  assert.equal(allProductsCard.children[1].children[1].textContent, "Browse our full collection");
+  assert.equal(allProductsCard.children[1].children[2].textContent, "Explore →");
   assert.equal(success.nodes.categories.children[1].href, "products.html?category=1");
   assert.equal(success.nodes.categories.children[1].children[0].children[1].src, "/uploads/candle.jpg");
   assert.equal(success.nodes["hero-product-collage"].children[1].children[0].src, "/uploads/candle.jpg");
@@ -2526,8 +2628,10 @@ test("product grid search is accessible, preserves newest-first results, and add
   nodes.productSearchPanel.hidden = true;
   const newest = { _id: "product-new", name: "New Resin Dish", image: "/uploads/new.jpg", price: 300, inStock: true, createdAt: "2026-11-10T00:00:00.000Z" };
   const older = { _id: "product-old", name: "Old Resin Dish", image: "https://res.cloudinary.com/demo/image/upload/old.jpg", price: 200, inStock: true, createdAt: "2026-10-10T00:00:00.000Z" };
+  const addCalls = [];
   const result = await runBrowserScript("public/products.js", {
     nodes,
+    shopFunctions: { addCartItemFromClick: (product, button) => { addCalls.push(product._id); button.textContent = "Added to cart"; } },
     fetchImpl: async url => url === "/api/categories"
       ? { ok: true, json: async () => [{ id: 2, name: "Resin Art" }] }
       : { ok: true, json: async () => [newest, older] }
@@ -2536,8 +2640,7 @@ test("product grid search is accessible, preserves newest-first results, and add
   assert.deepEqual(nodes.products.children.map(card => card.children[0].href), ["product.html?id=product-new", "product.html?id=product-old"]);
   assert.equal(nodes.products.children[0].children[1].textContent, "Add to Cart");
   nodes.products.children[0].children[1].handlers.click();
-  assert.equal(JSON.parse(result.storage.get("cart"))[0]._id, "product-new");
-  assert.equal(JSON.parse(result.storage.get("cart"))[0].qty, 1);
+  assert.deepEqual(addCalls, ["product-new"], "one click delegates one add action for the chosen product");
   assert.equal(nodes.products.children[0].children[1].textContent, "Added to cart");
 
   nodes.productSearchToggle.handlers.click();

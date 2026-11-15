@@ -147,7 +147,7 @@ function renderProducts(products) {
     addButton.type = "button";
     addButton.textContent = "Add to Cart";
     addButton.setAttribute("aria-label", `Add ${typeof product.name === "string" ? product.name : "handmade product"} to cart`);
-    addButton.addEventListener("click", () => addProductToCart(product, addButton));
+    addButton.addEventListener("click", () => addCartItemFromClick(product, addButton));
     card.append(productLink, addButton);
     productContainer.appendChild(card);
   });
@@ -157,30 +157,4 @@ if (searchInput) searchInput.addEventListener("input", filterProducts);
 function filterProducts() {
   const search = searchInput.value.toLowerCase().trim();
   renderProducts(allProducts.filter(product => String(product.name || "").toLowerCase().includes(search)));
-}
-
-function addProductToCart(product, button) {
-  if (!product?._id || product.inStock !== true) return;
-  try {
-    let cart = JSON.parse(localStorage.getItem("cart") || "[]");
-    if (!Array.isArray(cart)) cart = [];
-    const existing = cart.find(item => item?._id === product._id);
-    if (existing) {
-      const quantity = Number.isSafeInteger(Number(existing.qty)) && Number(existing.qty) > 0 ? Number(existing.qty) : 1;
-      if (quantity >= 99) {
-        button.textContent = "Maximum quantity reached";
-        return;
-      }
-      existing.qty = quantity + 1;
-    } else {
-      cart.push({ ...product, qty: 1 });
-    }
-    localStorage.setItem("cart", JSON.stringify(cart));
-    if (typeof announceCartUpdated === "function") announceCartUpdated();
-    button.textContent = "Added to cart";
-    button.setAttribute("aria-live", "polite");
-  } catch (error) {
-    console.error("Cart update failed:", error);
-    button.textContent = "Could not add item";
-  }
 }

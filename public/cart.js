@@ -170,6 +170,7 @@ function decrease(id) {
 function removeItem(id) {
     cart = cart.filter(product => product._id !== id);
     updateCart();
+    if (typeof showShopToast === "function") showShopToast("Removed from cart.");
 }
 function updateCart() {
     localStorage.setItem("cart", JSON.stringify(cart));

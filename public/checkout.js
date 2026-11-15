@@ -153,6 +153,7 @@ if (validOrderId(orderIdFromUrl)) {
       if (!validOrderId(data.orderId) || !validPublicReference(data.publicReference) || typeof data.confirmationToken !== "string") {
         throw new Error("The order may have been saved, but its confirmation could not be verified. Your cart is still saved; retry to recover the confirmation.");
       }
+      if (typeof playShopSound === "function") playShopSound("order");
       sessionStorage.setItem(confirmationStorageKey, JSON.stringify({ token: data.confirmationToken, publicReference: data.publicReference }));
       localStorage.removeItem("cart");
       sessionStorage.removeItem(checkoutKeyName);

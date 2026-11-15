@@ -4,6 +4,7 @@ const message = document.getElementById("orderSuccessMessage");
 const details = document.getElementById("orderSuccessDetails");
 const card = document.getElementById("orderSuccessCard");
 const successMark = document.getElementById("orderSuccessMark");
+const orderPlacedCelebration = document.getElementById("orderPlacedCelebration");
 const paymentPanel = document.getElementById("upiPaymentPanel");
 const paymentAmount = document.getElementById("upiPaymentAmount");
 const paymentReference = document.getElementById("upiPaymentReference");
@@ -43,6 +44,11 @@ function validUpiPayment(data) {
       params.get("am") === data.amount.toFixed(2) && params.get("cu") === "INR" &&
       params.get("tn") === data.reference;
   } catch { return false; }
+}
+
+function validPublicOrderReference(value) {
+  return typeof value === "string" && (/^AC-[A-HJ-NP-Z2-9]{5}$/.test(value) ||
+    /^ORD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value));
 }
 
 function showPaymentPending(data) {
@@ -121,9 +127,11 @@ async function loadOrderConfirmation() {
       credentials: "same-origin"
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || typeof data.publicReference !== "string" || !Array.isArray(data.items)) {
+    if (!response.ok || !validPublicOrderReference(data.publicReference) || !Array.isArray(data.items)) {
       throw new Error("The confirmation could not be verified.");
     }
+    if (orderPlacedCelebration) orderPlacedCelebration.hidden = false;
+    card.classList.add("order-placed-celebration-active");
     const paymentStatus = ["Pending", "Verification Pending", "Paid", "Failed / Mismatch", "Refunded"].includes(data.paymentStatus)
       ? data.paymentStatus : null;
     const statusCopy = {

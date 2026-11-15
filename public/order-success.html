@@ -11,6 +11,10 @@
     <main class="page-container order-success-page">
         <section id="orderSuccessCard" class="order-success-card" aria-live="polite" aria-busy="true">
             <div id="orderSuccessMark" class="order-success-mark" aria-hidden="true">✓</div>
+            <div id="orderPlacedCelebration" class="order-placed-celebration" aria-live="polite" hidden>
+                <span class="order-placed-check" aria-hidden="true">✓</span>
+                <span>Your order has been placed!</span>
+            </div>
             <p class="home-eyebrow">MADE WITH CARE</p>
             <h1 id="orderSuccessHeading">Checking your order…</h1>
             <p id="orderSuccessMessage" role="status">Please wait while we verify your confirmation.</p>
@@ -38,6 +42,7 @@
                 <p class="upi-payment-manual-verification">Your order will be confirmed for preparation after we manually verify your payment.</p>
             </section>
             <div class="order-success-actions">
+                <a class="primary-link-button" href="track-order.html">Track Order</a>
                 <a class="primary-link-button" href="products.html">Continue Shopping</a>
                 <a class="secondary-link-button" href="index.html">Back to Home</a>
             </div>
