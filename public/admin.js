@@ -90,6 +90,22 @@ async function loadProducts() {
       customizationCheckbox.addEventListener("change", () => updateCustomization(product._id, customizationCheckbox));
       customizationLabel.append(customizationCheckbox, document.createTextNode(" Enable customization enquiries"));
       card.appendChild(customizationLabel);
+
+      const homepageLabel = document.createElement("label");
+      homepageLabel.className = "admin-product-homepage";
+      const homepageCheckbox = document.createElement("input");
+      homepageCheckbox.type = "checkbox";
+      homepageCheckbox.checked = product.homepageFeatured === true;
+      homepageCheckbox.setAttribute("aria-label", `Display ${product.name || "this product"} on Homepage`);
+      homepageCheckbox.addEventListener("change", () => updateHomepageFeatured(product._id, homepageCheckbox));
+      homepageLabel.append(homepageCheckbox, document.createTextNode(" Display on Homepage"));
+      if (homepageCheckbox.checked) {
+        const selectedBadge = document.createElement("span");
+        selectedBadge.className = "admin-homepage-selected-badge";
+        selectedBadge.textContent = "Homepage pick";
+        homepageLabel.appendChild(selectedBadge);
+      }
+      card.appendChild(homepageLabel);
       productsContainer.appendChild(card);
     });
   } catch (error) {
@@ -112,6 +128,7 @@ async function addProduct() {
   formData.append("categoryId", categoryId);
   formData.append("image", file);
   formData.append("customizationEnabled", document.getElementById("customizationEnabled").checked ? "true" : "false");
+  formData.append("homepageFeatured", document.getElementById("homepageFeatured").checked ? "true" : "false");
   try {
     const response = await fetch("/api/products", { method: "POST", body: formData });
     const result = await response.json().catch(() => ({}));
@@ -154,6 +171,24 @@ async function updateCustomization(id, checkbox) {
     checkbox.checked = !requestedValue;
     alert(error.message || "Customization setting could not be saved.");
   } finally {
+    checkbox.disabled = false;
+  }
+}
+async function updateHomepageFeatured(id, checkbox) {
+  const requestedValue = checkbox.checked;
+  checkbox.disabled = true;
+  try {
+    const response = await fetch(`/api/products/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ homepageFeatured: requestedValue })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Homepage product selection could not be saved.");
+    await loadProducts();
+  } catch (error) {
+    checkbox.checked = !requestedValue;
+    alert(error.message || "Homepage product selection could not be saved.");
     checkbox.disabled = false;
   }
 }

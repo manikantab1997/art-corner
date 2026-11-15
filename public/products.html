@@ -2,12 +2,12 @@
 <html>
 
 <head>
-    <title>Products</title>
+    <title>Products | Art Corner BLR</title>
     <link rel="stylesheet" href="style.css">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 
-<body>
+<body class="products-page">
 
     <div id="navbar-container"></div>
 
@@ -18,11 +18,20 @@
             Discover our handcrafted collection
         </p>
 
-        <input id="search" placeholder="Search products...">
-
-        <select id="categoryFilter">
+        <div class="products-toolbar" aria-label="Product browsing controls">
+            <button id="productSearchToggle" class="product-search-toggle" type="button" aria-expanded="false" aria-controls="productSearchPanel" aria-label="Open product search">
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.8" cy="10.8" r="6.6"></circle><path d="m16 16 4.2 4.2"></path></svg>
+                <span>Search</span>
+            </button>
+            <select id="categoryFilter" aria-label="Filter products by category">
             <option value="">All Products</option>
-        </select>
+            </select>
+        </div>
+        <div id="productSearchPanel" class="product-search-panel" role="search" aria-label="Search products" hidden>
+            <label class="visually-hidden" for="search">Search products by name</label>
+            <input id="search" type="search" placeholder="Search products…" autocomplete="off">
+            <button id="productSearchClose" class="product-search-close" type="button" aria-label="Close product search">×</button>
+        </div>
         <p id="categoryFeedback" role="status" aria-live="polite"></p>
 
         <div id="products"></div>

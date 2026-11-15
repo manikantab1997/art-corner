@@ -87,7 +87,7 @@ if (!productId) {
         instagram.target = "_blank";
         instagram.rel = "noopener noreferrer";
         instagram.textContent = "Message us on Instagram";
-        instagram.setAttribute("aria-label", "Message Art Corner Bengaluru on Instagram about customization");
+        instagram.setAttribute("aria-label", "Message Art Corner BLR on Instagram about customization");
         links.append(whatsapp, instagram);
         enquiry.append(heading, description, links);
         productContainer.appendChild(enquiry);

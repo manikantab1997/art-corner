@@ -6,6 +6,9 @@ const pageTitle = document.getElementById("pageTitle");
 const categoryFilter = document.getElementById("categoryFilter");
 const productContainer = document.getElementById("products");
 const categoryFeedback = document.getElementById("categoryFeedback");
+const searchToggle = document.getElementById("productSearchToggle");
+const searchPanel = document.getElementById("productSearchPanel");
+const searchClose = document.getElementById("productSearchClose");
 productContainer.innerHTML = "<p role=\"status\">Loading products…</p>";
 const categoriesById = new Map();
 let selectedCategoryId = categoryId;
@@ -30,6 +33,26 @@ if (categoryFilter) {
     window.location.href = `products.html${query}`;
   });
 }
+
+function closeProductSearch(returnFocus = true) {
+  if (!searchPanel || searchPanel.hidden) return;
+  searchPanel.hidden = true;
+  searchToggle?.setAttribute("aria-expanded", "false");
+  searchToggle?.setAttribute("aria-label", "Open product search");
+  if (returnFocus) searchToggle?.focus();
+}
+
+searchToggle?.addEventListener("click", () => {
+  const opening = searchPanel.hidden;
+  searchPanel.hidden = !opening;
+  searchToggle.setAttribute("aria-expanded", String(opening));
+  searchToggle.setAttribute("aria-label", opening ? "Close product search" : "Open product search");
+  if (opening) searchInput?.focus();
+});
+searchClose?.addEventListener("click", () => closeProductSearch());
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && searchPanel && !searchPanel.hidden) closeProductSearch();
+});
 
 async function loadCatalog() {
   try {
@@ -83,32 +106,49 @@ async function loadCatalog() {
 }
 loadCatalog();
 function renderProducts(products) {
-  productContainer.innerHTML = "";
+  productContainer.replaceChildren();
   if (!products.length) {
-    productContainer.innerHTML = "<p>No products match your search yet.</p>";
+    const empty = document.createElement("p");
+    empty.className = "products-empty-state";
+    empty.textContent = "No products match your search yet.";
+    productContainer.appendChild(empty);
     return;
   }
   products.forEach(product => {
     const card = document.createElement("article");
-    card.className = "card";
-    card.tabIndex = 0;
-    card.setAttribute("role", "link");
+    card.className = "product-listing-card";
+    const productLink = document.createElement("a");
+    productLink.className = "product-listing-link";
+    productLink.href = `product.html?id=${encodeURIComponent(product._id)}`;
     const imageUrl = safeProductImageUrl(product.image);
     if (imageUrl) {
       const image = document.createElement("img");
       image.src = imageUrl;
       image.alt = typeof product.name === "string" ? product.name : "Handmade product";
       image.loading = "lazy";
-      card.appendChild(image);
+      productLink.appendChild(image);
+    } else {
+      const placeholder = document.createElement("span");
+      placeholder.className = "product-listing-image-placeholder";
+      placeholder.textContent = "Image unavailable";
+      placeholder.setAttribute("aria-label", "Product image unavailable");
+      productLink.appendChild(placeholder);
     }
+    const details = document.createElement("span");
+    details.className = "product-listing-details";
     const title = document.createElement("h3");
     title.textContent = typeof product.name === "string" ? product.name : "Handmade product";
     const price = document.createElement("p");
     price.textContent = `₹${Number.isFinite(Number(product.price)) ? Number(product.price) : "Price unavailable"}`;
-    card.append(title, price);
-    const openProduct = () => { window.location.href = `product.html?id=${encodeURIComponent(product._id)}`; };
-    card.addEventListener("click", openProduct);
-    card.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openProduct(); } });
+    details.append(title, price);
+    productLink.appendChild(details);
+    const addButton = document.createElement("button");
+    addButton.className = "product-listing-add-button";
+    addButton.type = "button";
+    addButton.textContent = "Add to Cart";
+    addButton.setAttribute("aria-label", `Add ${typeof product.name === "string" ? product.name : "handmade product"} to cart`);
+    addButton.addEventListener("click", () => addProductToCart(product, addButton));
+    card.append(productLink, addButton);
     productContainer.appendChild(card);
   });
 }
@@ -117,4 +157,30 @@ if (searchInput) searchInput.addEventListener("input", filterProducts);
 function filterProducts() {
   const search = searchInput.value.toLowerCase().trim();
   renderProducts(allProducts.filter(product => String(product.name || "").toLowerCase().includes(search)));
+}
+
+function addProductToCart(product, button) {
+  if (!product?._id || product.inStock !== true) return;
+  try {
+    let cart = JSON.parse(localStorage.getItem("cart") || "[]");
+    if (!Array.isArray(cart)) cart = [];
+    const existing = cart.find(item => item?._id === product._id);
+    if (existing) {
+      const quantity = Number.isSafeInteger(Number(existing.qty)) && Number(existing.qty) > 0 ? Number(existing.qty) : 1;
+      if (quantity >= 99) {
+        button.textContent = "Maximum quantity reached";
+        return;
+      }
+      existing.qty = quantity + 1;
+    } else {
+      cart.push({ ...product, qty: 1 });
+    }
+    localStorage.setItem("cart", JSON.stringify(cart));
+    if (typeof announceCartUpdated === "function") announceCartUpdated();
+    button.textContent = "Added to cart";
+    button.setAttribute("aria-live", "polite");
+  } catch (error) {
+    console.error("Cart update failed:", error);
+    button.textContent = "Could not add item";
+  }
 }

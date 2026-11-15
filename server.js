@@ -212,9 +212,32 @@ const productSchema = new mongoose.Schema({
     image: String,
     imagePublicId: { type: String, select: false, default: undefined },
     customizationEnabled: { type: Boolean, default: false },
+    homepageFeatured: { type: Boolean, default: false, select: false },
+    homepageSlot: { type: Number, min: 1, max: 3, select: false },
     inStock: { type: Boolean, default: true }
+}, { timestamps: true });
+productSchema.index({ homepageSlot: 1 }, {
+    unique: true,
+    partialFilterExpression: { homepageSlot: { $type: "number" } }
 });
 const Product = mongoose.model("Product", productSchema);
+
+async function getAvailableHomepageSlot() {
+    const selected = await Product.find({ homepageFeatured: true }).select("+homepageSlot").lean();
+    if (selected.length > 3) return { slot: null, conflict: "limit" };
+    const occupied = new Set();
+    for (const product of selected) {
+        if (!Number.isInteger(product.homepageSlot) || product.homepageSlot < 1 || product.homepageSlot > 3 || occupied.has(product.homepageSlot)) {
+            return { slot: null, conflict: "state" };
+        }
+        occupied.add(product.homepageSlot);
+    }
+    if (selected.length !== occupied.size) return { slot: null, conflict: "state" };
+    for (let slot = 1; slot <= 3; slot += 1) {
+        if (!occupied.has(slot)) return { slot, conflict: null };
+    }
+    return { slot: null, conflict: "limit" };
+}
 
 const legacyCategories = [
     { id: 1, name: "Candles", image: "/uploads/candle.jpg" },
@@ -326,6 +349,7 @@ async function createUpiPaymentDetails(order, { env = process.env, qrCode = QRCo
     params.set("pn", config.payeeName);
     params.set("am", amount.toFixed(2));
     params.set("cu", config.currency);
+    params.set("tr", reference);
     params.set("tn", reference);
     const uri = `upi://pay?${params.toString()}`;
     let qrCodeDataUrl = null;
@@ -399,7 +423,7 @@ function buildWhatsAppClickToChat(order, businessRecipient) {
     const reference = order.publicReference || order.orderId;
     const amount = Number(order.paymentAmount ?? order.total);
     if (!/^\d{8,15}$/.test(businessRecipient || "") || !reference || !Number.isFinite(amount) || amount < 0) return null;
-    const message = `Hello Art Corner Bengaluru, I have paid for order ${reference} (₹${amount.toFixed(2)}). My UPI transaction reference/UTR is: . I will attach my payment screenshot here.`;
+    const message = `Hello Art Corner BLR, I have paid for order ${reference} (₹${amount.toFixed(2)}). My UPI transaction reference/UTR is: . I will attach my payment screenshot here.`;
     return `https://wa.me/${businessRecipient}?text=${encodeURIComponent(message)}`;
 }
 
@@ -882,7 +906,7 @@ function createApp({
         if (!Number.isInteger(categoryId) || categoryId <= 0) {
             return res.status(400).json({ error: "categoryId must be a positive integer" });
         }
-        const products = await Product.find({ categoryId, inStock: true });
+        const products = await Product.find({ categoryId, inStock: true }).sort({ createdAt: -1, _id: -1 });
         res.json(products);
     });
 
@@ -902,6 +926,17 @@ function createApp({
         }
         if (req.body.customizationEnabled !== undefined && !["true", "false"].includes(req.body.customizationEnabled)) {
             return res.status(400).json({ error: "customizationEnabled must be true or false" });
+        }
+        if (req.body.homepageFeatured !== undefined && !["true", "false"].includes(req.body.homepageFeatured)) {
+            return res.status(400).json({ error: "homepageFeatured must be true or false" });
+        }
+        const homepageFeatured = req.body.homepageFeatured === "true";
+        let homepageSlot;
+        if (homepageFeatured) {
+            const selection = await getAvailableHomepageSlot();
+            if (selection.conflict === "state") return res.status(503).json({ error: "Homepage product selection needs administrator review before it can be changed" });
+            if (selection.slot === null) return res.status(409).json({ error: "Only three products can be displayed on the homepage" });
+            homepageSlot = selection.slot;
         }
         if (!req.file) {
             return res.status(400).json({ error: "A product image is required" });
@@ -937,12 +972,17 @@ function createApp({
         try {
             product = await new Product({
                 name, price, categoryId, image: uploadedImage.secureUrl, imagePublicId: uploadedImage.publicId,
-                customizationEnabled: req.body.customizationEnabled === "true"
+                customizationEnabled: req.body.customizationEnabled === "true",
+                homepageFeatured,
+                ...(homepageSlot ? { homepageSlot } : {})
             }).save();
         } catch (error) {
             // A rejected database save can have an ambiguous commit result. Retain
             // the Cloudinary asset rather than risk deleting an image now referenced.
             try { await releaseReservation(); } catch { console.error("Product category reservation cleanup failed"); }
+            if (error.code === 11000 && homepageFeatured) {
+                return res.status(409).json({ error: "Only three products can be displayed on the homepage. Refresh and try again." });
+            }
             throw error;
         }
         try {
@@ -1053,7 +1093,7 @@ function createApp({
             catch { console.error("UPI payment instructions could not be prepared for order tracking"); }
         }
         const contactWhatsAppUrl = recipient
-            ? `https://wa.me/${recipient}?text=${encodeURIComponent(`Hello Art Corner Bengaluru, I have a question about order ${publicReference}.`)}`
+            ? `https://wa.me/${recipient}?text=${encodeURIComponent(`Hello Art Corner BLR, I have a question about order ${publicReference}.`)}`
             : null;
         const sharePaymentDetailsUrl = order.customerWhatsAppOptIn === true && recipient
             ? buildWhatsAppClickToChat(paymentOrder, recipient)
@@ -1245,6 +1285,37 @@ function createApp({
         }
         const product = await Product.findById(req.params.id);
         if (!product) return res.status(404).json({ error: "Product not found" });
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, "homepageFeatured")) {
+            if (typeof req.body.homepageFeatured !== "boolean") {
+                return res.status(400).json({ error: "homepageFeatured must be a boolean" });
+            }
+            if (!req.body.homepageFeatured) {
+                const updated = await Product.findOneAndUpdate(
+                    { _id: req.params.id },
+                    { $set: { homepageFeatured: false }, $unset: { homepageSlot: 1 } },
+                    { new: true }
+                );
+                if (!updated) return res.status(404).json({ error: "Product not found" });
+                return res.json({ message: "Homepage product selection updated", homepageFeatured: false });
+            }
+            const alreadySelected = await Product.findOne({ _id: req.params.id, homepageFeatured: true }).select("+homepageSlot").lean();
+            if (alreadySelected) return res.json({ message: "Product is already selected for the homepage", homepageFeatured: true });
+            const selection = await getAvailableHomepageSlot();
+            if (selection.conflict === "state") return res.status(503).json({ error: "Homepage product selection needs administrator review before it can be changed" });
+            if (selection.slot === null) return res.status(409).json({ error: "Only three products can be displayed on the homepage" });
+            try {
+                const updated = await Product.findOneAndUpdate(
+                    { _id: req.params.id, homepageFeatured: { $ne: true } },
+                    { $set: { homepageFeatured: true, homepageSlot: selection.slot } },
+                    { new: true, runValidators: true }
+                );
+                if (!updated) return res.status(409).json({ error: "Product selection changed. Refresh and try again." });
+                return res.json({ message: "Product selected for the homepage", homepageFeatured: true });
+            } catch (error) {
+                if (error.code === 11000) return res.status(409).json({ error: "Only three products can be displayed on the homepage. Refresh and try again." });
+                throw error;
+            }
+        }
         if (Object.prototype.hasOwnProperty.call(req.body || {}, "customizationEnabled")) {
             if (typeof req.body.customizationEnabled !== "boolean") {
                 return res.status(400).json({ error: "customizationEnabled must be a boolean" });
@@ -1260,12 +1331,21 @@ function createApp({
 
     // Public product data remains limited to in-stock inventory.
     app.get("/api/products", async (req, res) => {
-        const products = await Product.find({ inStock: true });
+        const products = await Product.find({ inStock: true }).sort({ createdAt: -1, _id: -1 });
+        res.json(products);
+    });
+
+    app.get("/api/homepage-products", async (req, res) => {
+        const products = await Product.find({ homepageFeatured: true, inStock: true })
+            .select("_id name price image categoryId")
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(3)
+            .lean();
         res.json(products);
     });
 
     app.get("/api/admin/products", requireTrustedReadOrigin, requireAdmin, async (req, res) => {
-        const products = await Product.find({});
+        const products = await Product.find({}).select("+homepageFeatured").sort({ createdAt: -1, _id: -1 });
         res.json(products);
     });
 
@@ -1470,6 +1550,7 @@ async function startServer() {
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB Connected");
     await runStartupStage("legacy category seeding", seedLegacyCategories);
+    await runStartupStage("product index creation", () => Product.createIndexes());
     await runStartupStage("order index creation", () => Order.createIndexes());
     const store = MongoStore.create({
         client: mongoose.connection.getClient(),

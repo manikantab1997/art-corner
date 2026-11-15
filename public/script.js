@@ -1,7 +1,5 @@
 const categoriesContainer = document.getElementById("categories");
 const categoriesStatus = document.getElementById("home-category-status");
-const productsContainer = document.getElementById("featured-products");
-const productsStatus = document.getElementById("home-products-status");
 const heroCollage = document.getElementById("hero-product-collage");
 const heroCollageStatus = document.getElementById("hero-collage-status");
 
@@ -42,86 +40,73 @@ function getProductImageSource(product) {
   return "";
 }
 
-function renderHeroCollage(products, categories = [], emptyMessage = "Handmade details, thoughtfully chosen.") {
+function renderHeroCollage(products, emptyMessage = "No homepage picks are available right now.") {
   heroCollage.replaceChildren(heroCollageStatus);
   heroCollage.classList.remove("hero-product-collage-empty");
   heroCollage.classList.remove("hero-collage-count-1");
   heroCollage.classList.remove("hero-collage-count-2");
   heroCollage.classList.remove("hero-collage-count-3");
   heroCollageStatus.hidden = false;
-  const imageProducts = products
-    .map(product => ({ product, imageSource: getSavedProductImageSource(product?.image) }))
-    .filter(item => item.imageSource);
-  const featured = [];
-  const selectedProducts = new Set();
-
-  if (Array.isArray(categories)) {
-    categories.forEach(category => {
-      if (!category || !Number.isInteger(Number(category.id))) return;
-      const representative = imageProducts.find(item =>
-        !selectedProducts.has(item.product) && String(item.product.categoryId) === String(category.id)
-      );
-      if (representative && featured.length < 3) {
-        featured.push(representative);
-        selectedProducts.add(representative.product);
-      }
-    });
-  }
-  imageProducts.forEach(item => {
-    if (featured.length < 3 && !selectedProducts.has(item.product)) {
-      featured.push(item);
-      selectedProducts.add(item.product);
-    }
-  });
+  const featured = products
+    .filter(product => product && product._id && product.inStock !== false)
+    .slice(0, 3)
+    .map(product => ({ product, imageSource: getSavedProductImageSource(product?.image) }));
 
   if (!featured.length) {
     heroCollage.classList.add("hero-product-collage-empty");
-    heroCollageStatus.textContent = emptyMessage;
+    heroCollageStatus.textContent = products.length ? "Selected product photos are not available right now." : emptyMessage;
     return;
   }
   heroCollage.classList.add(`hero-collage-count-${featured.length}`);
+  heroCollageStatus.hidden = true;
 
-  let pendingImages = featured.length;
-  let visibleImages = 0;
   featured.forEach(({ product, imageSource }, index) => {
     const tile = document.createElement("a");
     tile.className = "hero-collage-tile";
     tile.href = `product.html?id=${encodeURIComponent(product._id)}`;
     tile.setAttribute("aria-label", `View ${product.name || "handmade product"}`);
 
-    const image = document.createElement("img");
-    image.alt = product.name || "Handmade product";
-    image.loading = index === 0 ? "eager" : "lazy";
-    image.decoding = "async";
-    image.hidden = true;
-    image.addEventListener("load", () => {
-      image.hidden = false;
-      visibleImages += 1;
-      pendingImages -= 1;
-      heroCollageStatus.hidden = true;
-    });
-    image.addEventListener("error", () => {
-      image.remove();
+    const photoPlaceholder = document.createElement("span");
+    photoPlaceholder.className = "hero-collage-photo-placeholder";
+    photoPlaceholder.textContent = "Loading photo…";
+    photoPlaceholder.setAttribute("role", "img");
+    photoPlaceholder.setAttribute("aria-label", `Loading photo for ${product.name || "handmade product"}`);
+
+    if (imageSource) {
+      const image = document.createElement("img");
+      image.alt = product.name || "Handmade product";
+      // The API caps this above-the-fold collage at three; eager loading avoids
+      // lazy images waiting inside tiles that used to be hidden until load.
+      image.loading = "eager";
+      image.decoding = "async";
+      image.fetchPriority = index === 0 ? "high" : "auto";
+      image.hidden = true;
+      image.addEventListener("load", () => {
+        image.hidden = false;
+        photoPlaceholder.hidden = true;
+      });
+      image.addEventListener("error", () => {
+        image.hidden = true;
+        photoPlaceholder.hidden = false;
+        photoPlaceholder.textContent = "Product photo unavailable";
+        photoPlaceholder.setAttribute("aria-label", `Product photo unavailable for ${product.name || "handmade product"}`);
+        tile.classList.add("hero-collage-tile-unavailable");
+      });
+      tile.append(image);
+      image.src = imageSource;
+    } else {
+      photoPlaceholder.textContent = "Product photo unavailable";
+      photoPlaceholder.setAttribute("aria-label", `Product photo unavailable for ${product.name || "handmade product"}`);
       tile.classList.add("hero-collage-tile-unavailable");
-      tile.setAttribute("aria-label", `View ${product.name || "handmade product"}; photo unavailable`);
-      caption.textContent = `${product.name || "Handmade product"} · Photo unavailable`;
-      pendingImages -= 1;
-      if (pendingImages === 0 && visibleImages === 0) {
-        heroCollage.replaceChildren(heroCollageStatus);
-        heroCollage.classList.remove("hero-collage-count-1");
-        heroCollage.classList.remove("hero-collage-count-2");
-        heroCollage.classList.remove("hero-collage-count-3");
-        heroCollage.classList.add("hero-product-collage-empty");
-        heroCollageStatus.hidden = false;
-        heroCollageStatus.textContent = "Product photos are temporarily unavailable.";
-      }
-    });
+    }
     const caption = document.createElement("span");
     caption.className = "hero-collage-caption";
-    caption.textContent = product.name || "Handmade favourite";
-    tile.append(image, caption);
+    const formattedPrice = Number.isFinite(Number(product.price))
+      ? new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(Number(product.price))
+      : "Price unavailable";
+    caption.textContent = `${product.name || "Handmade favourite"} · ${formattedPrice}`;
+    tile.append(photoPlaceholder, caption);
     heroCollage.appendChild(tile);
-    image.src = imageSource;
   });
 }
 
@@ -190,91 +175,20 @@ function renderCategories(categories, products) {
     : "No collections are available right now. You can still shop all products.";
 }
 
-function renderFeaturedProducts(products) {
-  productsContainer.replaceChildren();
-  const featured = products.filter(product => product && product.inStock !== false).slice(0, 4);
-  if (!featured.length) {
-    productsStatus.textContent = "There are no in-stock products to feature just now. Please check back soon.";
-    return;
-  }
-
-  productsStatus.textContent = "A few handmade favourites from our current collection.";
-  featured.forEach((product, index) => {
-    const card = document.createElement("article");
-    card.className = "home-product-card";
-    card.style.animationDelay = `${index * 70}ms`;
-
-    const link = document.createElement("a");
-    link.className = "home-product-image-link";
-    link.href = `product.html?id=${encodeURIComponent(product._id)}`;
-    link.setAttribute("aria-label", `View ${product.name || "handmade product"}`);
-
-    const isLocalPreview = isLocalPreviewProduct(product);
-    const categoryArtwork = {
-      1: "candle",
-      2: "resin",
-      3: "bracelet"
-    }[Number(product.categoryId)] || "generic";
-    const displayImage = getProductImageSource(product);
-    const fallback = document.createElement("span");
-    fallback.className = `product-image-placeholder${isLocalPreview ? ` product-artwork product-artwork-${categoryArtwork}` : ""}`;
-    if (isLocalPreview) {
-      fallback.setAttribute("aria-hidden", "true");
-      const artworkObject = document.createElement("span");
-      artworkObject.className = "product-artwork-object";
-      const artworkLabel = document.createElement("span");
-      artworkLabel.className = "product-artwork-label";
-      artworkLabel.textContent = "Local preview illustration";
-      fallback.append(artworkObject, artworkLabel);
-    } else {
-      fallback.textContent = product.image ? "Image unavailable" : "Image coming soon";
-    }
-
-    if (displayImage) {
-      const image = document.createElement("img");
-      image.src = displayImage;
-      image.alt = product.name || "Handmade product";
-      image.loading = "lazy";
-      image.hidden = true;
-      image.addEventListener("load", () => { image.hidden = false; });
-      image.addEventListener("load", () => { fallback.hidden = true; });
-      image.addEventListener("error", () => { image.remove(); });
-      link.appendChild(image);
-      link.appendChild(fallback);
-    } else {
-      link.appendChild(fallback);
-    }
-
-    const details = document.createElement("div");
-    details.className = "home-product-details";
-    const name = document.createElement("h3");
-    name.textContent = product.name || "Handmade piece";
-    const price = document.createElement("p");
-    price.className = "home-product-price";
-    price.textContent = `₹${product.price}`;
-    details.append(name, price);
-    card.append(link, details);
-    productsContainer.appendChild(card);
-  });
-}
-
 async function loadHomePage() {
-  const [categoryResult, productResult] = await Promise.allSettled([
+  const [categoryResult, productResult, homepageResult] = await Promise.allSettled([
     fetchHomeData("/api/categories", "Categories"),
-    fetchHomeData("/api/products", "Products")
+    fetchHomeData("/api/products", "Products"),
+    fetchHomeData("/api/homepage-products", "Homepage products")
   ]);
   const products = productResult.status === "fulfilled"
     ? productResult.value.filter(product => product && product.inStock === true)
     : [];
 
-  if (productResult.status === "fulfilled") {
-    renderFeaturedProducts(products);
-    renderHeroCollage(products, categoryResult.status === "fulfilled" ? categoryResult.value : []);
-  } else {
-    console.error("Featured product request failed:", productResult.reason);
-    renderHeroCollage([], [], "Product photos are temporarily unavailable.");
-    productsStatus.textContent = "Products are temporarily unavailable. Please try again shortly.";
-  }
+  if (productResult.status === "rejected") console.error("Product request failed:", productResult.reason);
+  if (homepageResult.status === "fulfilled") renderHeroCollage(homepageResult.value);
+  if (homepageResult.status === "rejected") console.error("Homepage product request failed:", homepageResult.reason);
+  if (homepageResult.status === "rejected") renderHeroCollage([], "Homepage picks are temporarily unavailable.");
 
   if (categoryResult.status === "fulfilled") {
     renderCategories(categoryResult.value, products);

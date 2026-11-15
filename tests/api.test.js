@@ -64,7 +64,13 @@ const validCheckoutBody = (items = [{ _id: testProductId, qty: 2, name: "Client 
   customer: { name: "A Customer", phone: "9876543210", email: "customer@example.com", address: "Bengaluru delivery address" },
   items
 });
-const productFindResult = products => ({ lean: async () => products });
+const productFindResult = products => ({
+  sort(value) { this.sortValue = value; return this; },
+  select(value) { this.selectValue = value; return this; },
+  limit(value) { this.limitValue = value; return this; },
+  lean: async () => products,
+  then(resolve, reject) { return Promise.resolve(products).then(resolve, reject); }
+});
 function makeCloudinaryMock({ fail = false } = {}) {
   const uploaded = [];
   const deleted = [];
@@ -369,7 +375,7 @@ function uiElement(tagName = "div") {
     querySelectorAll() { return this.children.flatMap(child => [child, ...(child.querySelectorAll ? child.querySelectorAll("") : [])]); }
   };
 }
-async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, stored = {} } = {}) {
+async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fetchImpl, search = "", requireAdminPage, confirmImpl = () => true, alertImpl = () => {}, stored = {} } = {}) {
   const storage = new Map(Object.entries(stored));
   const localStorage = { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) };
   const window = { history: { back() {}, replaceState(_state, _title, url) { this.replacedUrl = url; } }, location: { search, href: "" }, addEventListener() {}, dispatchEvent() {} };
@@ -387,21 +393,23 @@ async function runBrowserScript(relativePath, { nodes = {}, queryNodes = {}, fet
   vm.runInNewContext(source, {
     document, window: { ...window, confirm: confirmImpl }, localStorage, fetch: fetchImpl, console, URLSearchParams,
     URL, encodeURIComponent, requireAdminPage, confirm: confirmImpl, Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
-    FormData: class { append() {} }, alert() {}
+    FormData: class { append() {} }, alert: alertImpl
   });
   await new Promise(resolve => setTimeout(resolve, 0));
   return { window, nodes, storage, document };
 }
 
 test("GET /api/products queries only in-stock products", async () => {
-  stub(Product, "find", async filter => {
+  let sortBy;
+  stub(Product, "find", filter => {
     assert.deepEqual(filter, { inStock: true });
-    return [{ _id: "p1", name: "Sample", image: "/uploads/candle.jpg", inStock: true }];
+    return { sort(value) { sortBy = value; return this; }, then(resolve, reject) { return Promise.resolve([{ _id: "p1", name: "Sample", image: "/uploads/candle.jpg", inStock: true }]).then(resolve, reject); } };
   });
   const handlers = routeStack("get", "/api/products");
   const response = await invoke(handlers.at(-1));
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.body, [{ _id: "p1", name: "Sample", image: "/uploads/candle.jpg", inStock: true }]);
+  assert.deepEqual(sortBy, { createdAt: -1, _id: -1 }, "public listings sort newest first with a stable tie-breaker");
   restore();
 });
 test("POST /api/products returns a clear error for missing name and required fields", async () => {
@@ -638,8 +646,8 @@ test("new payment fields remain absent on legacy orders and UPI config is centra
   assert.equal(legacy.paymentAmount, undefined);
   const { getUpiPaymentConfig } = require("../server");
   assert.equal(getUpiPaymentConfig({}), null);
-  assert.deepEqual(getUpiPaymentConfig({ UPI_ID: "artcorner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" }), {
-    upiId: "artcorner@bank", payeeName: "Art Corner Bengaluru", currency: "INR"
+  assert.deepEqual(getUpiPaymentConfig({ UPI_ID: "artcorner@bank", UPI_PAYEE_NAME: "Art Corner BLR" }), {
+    upiId: "artcorner@bank", payeeName: "Art Corner BLR", currency: "INR"
   });
   assert.throws(() => getUpiPaymentConfig({ UPI_ID: "artcorner@bank" }), /incomplete or invalid/);
 });
@@ -728,6 +736,7 @@ test("customer WhatsApp templates use the trusted amount and an encoded click-to
   assert.deepEqual(payload.template.components[0].parameters.map(value => value.text), ["A Customer", "AC-7K2P9", "325.50", buildWhatsAppClickToChat(order, "919380125087")]);
   const share = new URL(buildWhatsAppClickToChat(order, "919380125087"));
   assert.equal(share.hostname, "wa.me");
+  assert.match(share.searchParams.get("text"), /^Hello Art Corner BLR,/);
   assert.match(share.searchParams.get("text"), /AC-7K2P9/);
   assert.match(share.searchParams.get("text"), /₹325\.50/);
   assert.match(share.searchParams.get("text"), /UTR/);
@@ -992,6 +1001,149 @@ test("product customization defaults off and admin can persist an explicit setti
     });
     assert.equal(invalid.statusCode, 400);
   } finally { Product.findById = originalFindById; }
+});
+
+test("homepage curation defaults off and uses an indexed three-slot limit", () => {
+  assert.equal(new Product().homepageFeatured, false, "legacy and new documents default to unselected");
+  assert.equal(Product.schema.path("homepageFeatured").options.select, false, "selection metadata stays out of normal public model queries");
+  const homepageSlotIndex = Product.schema.indexes().find(([keys]) => keys.homepageSlot === 1);
+  assert.ok(homepageSlotIndex, "homepage slots have a MongoDB index");
+  assert.equal(homepageSlotIndex[1].unique, true);
+  assert.deepEqual(homepageSlotIndex[1].partialFilterExpression, { homepageSlot: { $type: "number" } });
+});
+
+test("admin can select and deselect a product for the homepage without changing its other fields", async () => {
+  const originalFindById = Product.findById;
+  const originalFind = Product.find;
+  const originalFindOne = Product.findOne;
+  const originalFindOneAndUpdate = Product.findOneAndUpdate;
+  let captured;
+  Product.findById = async () => ({ _id: "507f1f77bcf86cd799439011", inStock: true, price: 25 });
+  Product.find = filter => {
+    assert.deepEqual(filter, { homepageFeatured: true });
+    return productFindResult([{ _id: "a", homepageSlot: 1 }, { _id: "b", homepageSlot: 2 }]);
+  };
+  Product.findOne = () => ({ select() { return this; }, lean: async () => null });
+  Product.findOneAndUpdate = async (filter, update) => { captured = { filter, update }; return { _id: filter._id }; };
+  try {
+    const handler = routeStack("put", "/api/products/:id").at(-1);
+    const selected = await invoke(handler, { params: { id: "507f1f77bcf86cd799439011" }, body: { homepageFeatured: true } });
+    assert.equal(selected.statusCode, 200);
+    assert.equal(selected.body.homepageFeatured, true);
+    assert.deepEqual(captured.update.$set, { homepageFeatured: true, homepageSlot: 3 });
+
+    const deselected = await invoke(handler, { params: { id: "507f1f77bcf86cd799439011" }, body: { homepageFeatured: false } });
+    assert.equal(deselected.statusCode, 200);
+    assert.deepEqual(captured.update, { $set: { homepageFeatured: false }, $unset: { homepageSlot: 1 } });
+  } finally {
+    Product.findById = originalFindById;
+    Product.find = originalFind;
+    Product.findOne = originalFindOne;
+    Product.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("server rejects a fourth homepage selection and resolves concurrent slot races with a conflict", async () => {
+  const originalFindById = Product.findById;
+  const originalFind = Product.find;
+  const originalFindOne = Product.findOne;
+  const originalFindOneAndUpdate = Product.findOneAndUpdate;
+  const handler = routeStack("put", "/api/products/:id").at(-1);
+  const ids = ["507f1f77bcf86cd799439011", "507f1f77bcf86cd799439012"];
+  let selected = [{ _id: "a", homepageSlot: 1 }, { _id: "b", homepageSlot: 2 }];
+  const occupied = new Set([1, 2]);
+  Product.findById = async () => ({ inStock: true });
+  Product.find = () => productFindResult(selected.map(item => ({ ...item })));
+  Product.findOne = () => ({ select() { return this; }, lean: async () => null });
+  Product.findOneAndUpdate = async (filter, update) => {
+    const slot = update.$set.homepageSlot;
+    if (occupied.has(slot)) { const error = new Error("duplicate key"); error.code = 11000; throw error; }
+    occupied.add(slot);
+    selected.push({ _id: filter._id, homepageSlot: slot });
+    return { _id: filter._id };
+  };
+  try {
+    const results = await Promise.all(ids.map(id => invoke(handler, { params: { id }, body: { homepageFeatured: true } })));
+    assert.deepEqual(results.map(result => result.statusCode).sort(), [200, 409]);
+    assert.equal(selected.length, 3, "the unique slot index prevents a fourth concurrent selection");
+
+    const fourth = await invoke(handler, { params: { id: "507f1f77bcf86cd799439013" }, body: { homepageFeatured: true } });
+    assert.equal(fourth.statusCode, 409);
+    assert.match(fourth.body.error, /Only three products/);
+    assert.equal(selected.length, 3);
+
+    const invalid = await invoke(handler, { params: { id: "507f1f77bcf86cd799439013" }, body: { homepageFeatured: "true" } });
+    assert.equal(invalid.statusCode, 400);
+  } finally {
+    Product.findById = originalFindById;
+    Product.find = originalFind;
+    Product.findOne = originalFindOne;
+    Product.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("homepage products API returns only selected, in-stock fields with newest-first limit of three", async () => {
+  const originalFind = Product.find;
+  let filter;
+  let projection;
+  let sortBy;
+  let max;
+  const results = [{ _id: "p3", name: "Newest", price: 3, image: "/uploads/newest.jpg", categoryId: 2 }];
+  Product.find = query => {
+    filter = query;
+    return {
+      select(value) { projection = value; return this; },
+      sort(value) { sortBy = value; return this; },
+      limit(value) { max = value; return this; },
+      lean: async () => results
+    };
+  };
+  try {
+    const response = await invoke(routeStack("get", "/api/homepage-products").at(-1));
+    assert.deepEqual(filter, { homepageFeatured: true, inStock: true });
+    assert.equal(projection, "_id name price image categoryId");
+    assert.deepEqual(sortBy, { createdAt: -1, _id: -1 });
+    assert.equal(max, 3);
+    assert.deepEqual(response.body, results);
+  } finally { Product.find = originalFind; }
+});
+
+test("product creation rejects a fourth homepage pick before storage or upload", async () => {
+  const originalFind = Product.find;
+  const originalSave = Product.prototype.save;
+  let saved = false;
+  Product.find = filter => {
+    assert.deepEqual(filter, { homepageFeatured: true });
+    return productFindResult([{ homepageSlot: 1 }, { homepageSlot: 2 }, { homepageSlot: 3 }]);
+  };
+  Product.prototype.save = async function () { saved = true; return this; };
+  try {
+    const result = await invoke(routeStack("post", "/api/products").at(-1), {
+      body: { name: "Fourth homepage pick", price: "20", categoryId: "1", homepageFeatured: "true" }
+    });
+    assert.equal(result.statusCode, 409);
+    assert.match(result.body.error, /Only three products/);
+    assert.equal(saved, false);
+  } finally {
+    Product.find = originalFind;
+    Product.prototype.save = originalSave;
+  }
+});
+
+test("category product listing sorts newest first with deterministic legacy fallback", async () => {
+  const originalFind = Product.find;
+  let filter;
+  let sortBy;
+  Product.find = value => {
+    filter = value;
+    return { sort(value) { sortBy = value; return this; }, then(resolve, reject) { return Promise.resolve([{ _id: "new", createdAt: new Date() }, { _id: "legacy" }]).then(resolve, reject); } };
+  };
+  try {
+    const response = await invoke(routeStack("get", "/api/products/:categoryId").at(-1), { params: { categoryId: "2" } });
+    assert.deepEqual(filter, { categoryId: 2, inStock: true });
+    assert.deepEqual(sortBy, { createdAt: -1, _id: -1 });
+    assert.equal(response.body.length, 2, "legacy records without createdAt remain included");
+  } finally { Product.find = originalFind; }
 });
 
 test("product customization links are conditional and use the configured business profiles", async () => {
@@ -1449,6 +1601,7 @@ test("UPI payment URI and QR use the trusted amount, encoded payee details, and 
   assert.equal(parsed.searchParams.get("pn"), "Art Corner & Crafts");
   assert.equal(parsed.searchParams.get("am"), "251.25");
   assert.equal(parsed.searchParams.get("cu"), "INR");
+  assert.equal(parsed.searchParams.get("tr"), "AC-7K2P9");
   assert.equal(parsed.searchParams.get("tn"), "AC-7K2P9");
   assert.match(payment.uri, /pn=Art\+Corner\+%26\+Crafts/);
   assert.equal(urisSentToQr[0].uri, payment.uri);
@@ -1482,7 +1635,7 @@ test("order confirmation returns server payment details only with its signed tok
   const paymentApp = createApp({
     sessionSecret: "signed-order-confirmation-test-secret",
     storefrontOrigin: "http://localhost:3000",
-    upiEnv: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" },
+    upiEnv: { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner BLR" },
     qrCodeGenerator: { toDataURL: async uri => { qrUri = uri; return "data:image/png;base64,cXJjb2Rl"; } }
   });
   const handler = routeStack("get", "/api/order-confirmation", paymentApp).at(-1);
@@ -1499,6 +1652,11 @@ test("order confirmation returns server payment details only with its signed tok
     assert.equal(confirmed.body.paymentAmount, 375);
     assert.equal(confirmed.body.upiPayment.amount, 375);
     assert.equal(confirmed.body.upiPayment.reference, "AC-7K2P9");
+  const confirmationUri = new URL(confirmed.body.upiPayment.uri);
+  assert.equal(confirmationUri.searchParams.get("tr"), "AC-7K2P9");
+  assert.equal(confirmationUri.searchParams.get("tn"), "AC-7K2P9");
+  assert.equal(confirmationUri.searchParams.get("am"), "375.00");
+  assert.equal(confirmationUri.searchParams.get("cu"), "INR");
     assert.equal(qrUri, confirmed.body.upiPayment.uri);
     assert.equal(JSON.stringify(confirmed.body).includes("ORD-private"), false);
     assert.equal(savedOrder.paymentStatus, "Pending", "reading payment instructions does not change payment status");
@@ -1508,7 +1666,7 @@ test("order confirmation returns server payment details only with its signed tok
 });
 
 test("order success page shows UPI pending instructions, supports copying, and keeps a no-config fallback", async () => {
-  const env = { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner Bengaluru" };
+  const env = { UPI_ID: "art.corner@bank", UPI_PAYEE_NAME: "Art Corner BLR" };
   const trusted = await createUpiPaymentDetails({ publicReference: "AC-7K2P9", paymentStatus: "Pending", paymentAmount: 290 }, {
     env, qrCode: { toDataURL: async () => "data:image/png;base64,cXJjb2Rl" }
   });
@@ -1526,6 +1684,7 @@ test("order success page shows UPI pending instructions, supports copying, and k
   assert.equal(browser.nodes.upiPaymentAmount.textContent, "Amount to pay: ₹290.00 INR");
   assert.equal(browser.nodes.upiPayButton.textContent, "Pay ₹290.00 using UPI");
   assert.equal(browser.nodes.upiPayButton.href, trusted.uri);
+  assert.equal(new URL(browser.nodes.upiPayButton.href).searchParams.get("tr"), "AC-7K2P9");
   assert.equal(browser.nodes.sharePaymentDetailsLink.href, "https://wa.me/919380125087?text=Order%20AC-7K2P9");
   assert.equal(browser.nodes.sharePaymentDetailsLink.hidden, false);
   assert.equal(browser.nodes.upiQrImage.src, trusted.qrCodeDataUrl);
@@ -1539,6 +1698,7 @@ test("order success page shows UPI pending instructions, supports copying, and k
   assert.equal(browser.fetchCalls[0].url, "/api/order-confirmation");
   assert.equal(browser.fetchCalls[0].options.method, undefined);
   assert.equal(browser.nodes.orderSuccessCard.attributes["aria-busy"], "false");
+  assert.equal(browser.fetchCalls[0].url, "/api/order-confirmation");
 
   const noConfig = await orderSuccessBrowser({ responseBody: {
     publicReference: "AC-7K2P9", status: "Placed", items: [], paymentStatus: "Pending",
@@ -1737,8 +1897,12 @@ test("HTTP product upload rejects unsupported file types and files over 5 MB", a
 test("HTTP product upload stores the Cloudinary URL and public ID after upload succeeds", async () => {
   await withCategoryMocks(async () => {
     const cloudinaryClient = makeCloudinaryMock();
-    let savedProduct;
-    stub(Product.prototype, "save", async function () { savedProduct = this; return this; });
+    const savedProducts = [];
+    stub(Product, "find", filter => {
+      assert.deepEqual(filter, { homepageFeatured: true });
+      return productFindResult([]);
+    });
+    stub(Product.prototype, "save", async function () { savedProducts.push(this); return this; });
     await withHttpApp(async ({ request }) => {
       const login = await request("/api/admin/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -1748,13 +1912,26 @@ test("HTTP product upload stores the Cloudinary URL and public ID after upload s
       form.append("name", "Test candle");
       form.append("price", "250");
       form.append("categoryId", "1");
+      form.append("homepageFeatured", "true");
       form.append("image", new Blob([validPngFile().buffer], { type: "image/png" }), "product.png");
       const result = await request("/api/products", { method: "POST", cookie: sessionCookie(login.setCookies), body: form });
       assert.equal(result.response.status, 201);
       const body = JSON.parse(result.text);
       assert.equal(body.product.image, "https://images.example.test/art-corner/item.png");
-      assert.equal(savedProduct.imagePublicId, "art-corner/products/item");
-      assert.equal(cloudinaryClient.uploaded.length, 1);
+      assert.equal(savedProducts[0].imagePublicId, "art-corner/products/item");
+      assert.equal(savedProducts[0].homepageFeatured, true);
+      assert.equal(savedProducts[0].homepageSlot, 1);
+
+      const defaultForm = new FormData();
+      defaultForm.append("name", "Unselected test product");
+      defaultForm.append("price", "125");
+      defaultForm.append("categoryId", "1");
+      defaultForm.append("image", new Blob([validPngFile().buffer], { type: "image/png" }), "default.png");
+      const defaultResult = await request("/api/products", { method: "POST", cookie: sessionCookie(login.setCookies), body: defaultForm });
+      assert.equal(defaultResult.response.status, 201);
+      assert.equal(savedProducts[1].homepageFeatured, false, "new products default off unless explicitly selected");
+      assert.equal(savedProducts[1].homepageSlot, undefined);
+      assert.equal(cloudinaryClient.uploaded.length, 2);
       assert.equal(cloudinaryClient.uploaded[0].options.folder, "art-corner/products");
     }, { cloudinaryClient, cloudinaryConfigured: true });
   });
@@ -2028,9 +2205,16 @@ test("admin product listing requires session and trusted origin, then includes o
     const unauthorized = await request("/api/admin/products");
     assert.equal(unauthorized.response.status, 401);
     const originalFind = Product.find;
-    Product.find = async filter => {
+    let selection;
+    let sortBy;
+    Product.find = filter => {
       assert.deepEqual(filter, {});
-      return [{ _id: "p1", inStock: true }, { _id: "p2", inStock: false }];
+      const query = productFindResult([{ _id: "p1", inStock: true, homepageFeatured: true }, { _id: "p2", inStock: false, homepageFeatured: false }]);
+      const select = query.select;
+      query.select = value => { selection = value; return select.call(query, value); };
+      const sort = query.sort;
+      query.sort = value => { sortBy = value; return sort.call(query, value); };
+      return query;
     };
     try {
       const login = await request("/api/admin/login", {
@@ -2043,6 +2227,9 @@ test("admin product listing requires session and trusted origin, then includes o
       const authorized = await request("/api/admin/products", { cookie, origin: testOrigin });
       assert.equal(authorized.response.status, 200);
       assert.deepEqual(JSON.parse(authorized.text).map(product => product.inStock), [true, false]);
+      assert.deepEqual(JSON.parse(authorized.text).map(product => product.homepageFeatured), [true, false]);
+      assert.equal(selection, "+homepageFeatured", "admin product listing explicitly retrieves the admin-only selection flag");
+      assert.deepEqual(sortBy, { createdAt: -1, _id: -1 });
       const sameOriginBrowserGet = await request("/api/admin/products", {
         cookie, origin: null,
         headers: { "Sec-Fetch-Site": "same-origin", Host: new URL(testOrigin).host }
@@ -2055,120 +2242,196 @@ test("admin product listing requires session and trusted origin, then includes o
     }
   });
 });
-test("homepage renders API-driven collection cards and real in-stock featured products", async () => {
+test("homepage uses dynamic categories and only the curated homepage product response", async () => {
   const html = fs.readFileSync(path.join(__dirname, "../public/index.html"), "utf8");
   assert.match(html, /class="home-hero"/);
-  assert.match(html, /Shop All Products/);
-  assert.match(html, /id="featured-products"/);
+  assert.match(html, /View All Products/);
+  assert.doesNotMatch(html, /Featured Products|id="featured-products"/);
+  assert.equal((html.match(/View All Products/g) || []).length, 1);
 
   const categories = [{ id: 1, name: "Candles" }, { id: 4, name: "Pottery" }];
   const products = [
     { _id: "p1", name: "Tree Candle", categoryId: 1, price: 600, image: "/uploads/candle.jpg", inStock: true },
     { _id: "p2", name: "Out of stock", categoryId: 4, price: 1, image: "/uploads/out.jpg", inStock: false }
   ];
+  const homepageProducts = [products[0]];
   const nodes = {
     categories: uiElement("div"),
     "home-category-status": uiElement("p"),
-    "featured-products": uiElement("div"),
-    "home-products-status": uiElement("p"),
     "hero-product-collage": uiElement("div"),
     "hero-collage-status": uiElement("p")
   };
   const success = await runBrowserScript("public/script.js", {
     nodes,
-    fetchImpl: async url => ({
-      ok: true,
-      json: async () => url === "/api/categories" ? categories : products
-    })
+    fetchImpl: async url => ({ ok: true, json: async () => ({
+      "/api/categories": categories,
+      "/api/products": products,
+      "/api/homepage-products": homepageProducts
+    })[url] })
   });
   assert.equal(success.nodes.categories.children.length, 3, "All Products plus API categories render");
   assert.deepEqual(success.nodes.categories.children.map(card => card.children[1].children[0].textContent), ["All Products", "Candles", "Pottery"]);
   assert.equal(success.nodes.categories.children[1].href, "products.html?category=1");
   assert.equal(success.nodes.categories.children[1].children[0].children[1].src, "/uploads/candle.jpg");
-  assert.equal(success.nodes["featured-products"].children.length, 1, "out-of-stock products stay hidden");
-  assert.equal(success.nodes["featured-products"].children[0].children[1].children[0].textContent, "Tree Candle");
   assert.equal(success.nodes["hero-product-collage"].children[1].children[0].src, "/uploads/candle.jpg");
+  assert.match(success.nodes["hero-product-collage"].children[1].children.find(child => child.className === "hero-collage-caption").textContent, /Tree Candle.*₹600/);
 });
-test("homepage uses saved HTTPS product images and neutral placeholders for ordinary products", async () => {
+test("homepage displays selected saved image URLs and leaves regular products out of the hero", async () => {
   const nodes = {
     categories: uiElement("div"),
     "home-category-status": uiElement("p"),
-    "featured-products": uiElement("div"),
-    "home-products-status": uiElement("p"),
     "hero-product-collage": uiElement("div"),
     "hero-collage-status": uiElement("p")
   };
-  const products = [
+  const regularProducts = [
     { _id: "cloud", name: "Cloudinary item", categoryId: 4, price: 10, image: "https://res.cloudinary.com/example/image/upload/item.jpg", inStock: true },
-    { _id: "invalid", name: "Invalid image item", categoryId: 4, price: 10, image: "javascript:alert(1)", inStock: true },
-    { _id: "empty", name: "No image item", categoryId: 4, price: 10, image: "", inStock: true }
+    { _id: "other", name: "Unselected regular product", categoryId: 4, price: 12, image: "/uploads/candle.jpg", inStock: true }
+  ];
+  const selected = [
+    regularProducts[0],
+    { _id: "unsafe", name: "Unsafe selected image", categoryId: 4, price: 11, image: "javascript:alert(1)", inStock: true },
+    { _id: "missing", name: "Missing image", categoryId: 4, price: 13, image: "", inStock: true }
   ];
   const result = await runBrowserScript("public/script.js", {
     nodes,
-    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products" ? products : [] })
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products" ? regularProducts : url === "/api/homepage-products" ? selected : [] })
   });
-  const cards = result.nodes["featured-products"].children;
-  assert.equal(cards[0].children[0].children[0].src, products[0].image);
-  assert.equal(result.nodes["hero-product-collage"].children[1].children[0].src, products[0].image, "hero collage uses the saved Cloudinary HTTPS URL");
-  assert.equal(cards[0].children[0].children[1].hidden, false);
-  cards[0].children[0].children[0].handlers.error();
-  assert.equal(cards[0].children[0].children[0].removed, true);
-  assert.equal(cards[0].children[0].children[1].hidden, false, "failed image requests retain the neutral fallback");
-  assert.equal(cards[1].children[0].children.length, 1);
-  assert.equal(cards[1].children[0].children[0].textContent, "Image unavailable");
-  assert.equal(cards[2].children[0].children[0].textContent, "Image coming soon");
-  assert.ok(cards.every(card => !card.children[0].children[0].className.includes("product-artwork")));
+  const collage = result.nodes["hero-product-collage"];
+  assert.equal(collage.children.length, 4, "all selected products keep a tile, including products without a valid image");
+  assert.equal(collage.children[1].children[0].src, regularProducts[0].image);
+  assert.match(collage.children[1].children.find(child => child.className === "hero-collage-caption").textContent, /Cloudinary item.*₹10/);
+  assert.equal(collage.children[2].href, "product.html?id=unsafe");
+  assert.equal(collage.children[2].hidden, false, "unsafe image values do not hide the product tile");
+  assert.equal(collage.children[3].href, "product.html?id=missing");
+  assert.equal(collage.children[3].hidden, false, "missing image values do not hide the product tile");
+  assert.equal(collage.children[3].children[0].textContent, "Product photo unavailable");
+  assert.equal(collage.children.some(tile => tile.href?.includes("other")), false, "normal products are not used to fill unselected slots");
 });
-test("category-specific preview illustrations are limited to labeled local sample products", async () => {
+test("homepage renders up to three visible curated tiles and reveals each image independently", async () => {
   const nodes = {
     categories: uiElement("div"),
     "home-category-status": uiElement("p"),
-    "featured-products": uiElement("div"),
-    "home-products-status": uiElement("p"),
     "hero-product-collage": uiElement("div"),
     "hero-collage-status": uiElement("p")
   };
-  const products = [
-    { _id: "candle", name: "[LOCAL PREVIEW] Sample Candle", categoryId: 1, price: 10, image: "", inStock: true },
-    { _id: "resin", name: "[LOCAL PREVIEW] Sample Resin", categoryId: 2, price: 10, image: "", inStock: true },
-    { _id: "bracelet", name: "[LOCAL PREVIEW] Sample Bracelet", categoryId: 3, price: 10, image: "", inStock: true },
-    { _id: "ordinary", name: "Ordinary Candle", categoryId: 1, price: 10, image: "", inStock: true }
+  const selected = [
+    { _id: "first", name: "First", price: 10, image: "/uploads/first.jpg", inStock: true },
+    { _id: "second", name: "Second", price: 20, image: "https://images.example.test/second.jpg", inStock: true },
+    { _id: "third", name: "Third", price: 30, image: "/uploads/third.jpg", inStock: true },
+    { _id: "fourth", name: "Fourth", price: 40, image: "/uploads/fourth.jpg", inStock: true }
   ];
   const result = await runBrowserScript("public/script.js", {
     nodes,
-    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products" ? products : [] })
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/homepage-products" ? selected : [] })
   });
-  const cards = result.nodes["featured-products"].children;
-  assert.equal(cards[0].children[0].children[0].src, "/uploads/candle.jpg");
-  assert.match(cards[0].children[0].children[1].className, /product-artwork-candle/);
-  assert.match(cards[1].children[0].children[0].className, /product-artwork-resin/);
-  assert.match(cards[2].children[0].children[0].className, /product-artwork-bracelet/);
-  assert.equal(cards[3].children[0].children[0].textContent, "Image coming soon");
-  assert.doesNotMatch(cards[3].children[0].children[0].className, /product-artwork/);
+  const collage = result.nodes["hero-product-collage"];
+  const tiles = collage.children.filter(child => child.tagName === "a");
+  assert.equal(tiles.length, 3, "the client never renders more than the curated API's three-item maximum");
+  assert.ok(tiles.every(tile => tile.hidden === false), "tile visibility is independent of image load events");
+  assert.deepEqual(tiles.map(tile => tile.href), ["product.html?id=first", "product.html?id=second", "product.html?id=third"]);
+  const images = tiles.map(tile => tile.children.find(child => child.tagName === "img"));
+  assert.ok(images.every(image => image.loading === "eager"), "above-the-fold hero images do not wait for lazy-loading");
+  assert.equal(images[0].fetchPriority, "high");
+  assert.ok(images.slice(1).every(image => image.fetchPriority === "auto"));
+  images.forEach((image, index) => {
+    assert.equal(image.hidden, true, "the image stays covered by its placeholder until its own load event");
+    image.handlers.load();
+    assert.equal(image.hidden, false);
+    assert.equal(tiles[index].children.find(child => child.className === "hero-collage-photo-placeholder").hidden, true);
+  });
+  assert.ok(tiles.every(tile => tile.children.some(child => child.textContent.includes("₹"))));
+  assert.ok(collage.classList.contains("hero-collage-count-3"));
+});
+test("homepage image load failures keep the tile and show a product photo fallback", async () => {
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
+  };
+  const result = await runBrowserScript("public/script.js", {
+    nodes,
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/homepage-products" ? [
+      { _id: "broken", name: "Broken photo", price: 5, image: "/uploads/broken.jpg", inStock: true },
+      { _id: "good", name: "Working photo", price: 6, image: "/uploads/good.jpg", inStock: true }
+    ] : [] })
+  });
+  const collage = result.nodes["hero-product-collage"];
+  const [broken, good] = collage.children.filter(child => child.tagName === "a");
+  broken.children.find(child => child.tagName === "img").handlers.error();
+  assert.equal(broken.hidden, false);
+  assert.equal(broken.children.find(child => child.tagName === "img").hidden, true);
+  assert.equal(broken.children.find(child => child.className === "hero-collage-photo-placeholder").textContent, "Product photo unavailable");
+  assert.ok(broken.classList.contains("hero-collage-tile-unavailable"));
+  assert.equal(broken.children.at(-1).textContent, "Broken photo · ₹5.00");
+  assert.equal(good.hidden, false, "another image's failure does not affect neighboring product tiles");
+});
+test("homepage collage uses compact one- and two-product layouts and cleanly empties with no picks", async () => {
+  const makeNodes = () => ({
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
+  });
+  for (const count of [1, 2]) {
+    const nodes = makeNodes();
+    const items = Array.from({ length: count }, (_, index) => ({
+      _id: `p${index + 1}`, name: `Pick ${index + 1}`, price: 10, image: `/uploads/p${index + 1}.jpg`, inStock: true
+    }));
+    const result = await runBrowserScript("public/script.js", {
+      nodes,
+      fetchImpl: async url => ({ ok: true, json: async () => url === "/api/homepage-products" ? items : [] })
+    });
+    const collage = result.nodes["hero-product-collage"];
+    assert.equal(collage.children.filter(child => child.tagName === "a").length, count);
+    assert.ok(collage.children.filter(child => child.tagName === "a").every(tile => !tile.hidden));
+    assert.ok(collage.classList.contains(`hero-collage-count-${count}`));
+  }
+  const nodes = makeNodes();
+  const empty = await runBrowserScript("public/script.js", {
+    nodes,
+    fetchImpl: async () => ({ ok: true, json: async () => [] })
+  });
+  const collage = empty.nodes["hero-product-collage"];
+  assert.equal(collage.children.length, 1, "empty selection removes all old product tiles");
+  assert.equal(collage.children[0], empty.nodes["hero-collage-status"]);
+  assert.match(collage.children[0].textContent, /No homepage picks/i);
+  assert.ok(collage.classList.contains("hero-product-collage-empty"));
+});
+test("homepage never substitutes arbitrary products when no selections exist", async () => {
+  const nodes = {
+    categories: uiElement("div"),
+    "home-category-status": uiElement("p"),
+    "hero-product-collage": uiElement("div"),
+    "hero-collage-status": uiElement("p")
+  };
+  const result = await runBrowserScript("public/script.js", {
+    nodes,
+    fetchImpl: async url => ({ ok: true, json: async () => url === "/api/products"
+      ? [{ _id: "regular", name: "Regular available product", categoryId: 1, price: 10, image: "/uploads/candle.jpg", inStock: true }]
+      : [] })
+  });
+  assert.equal(result.nodes["hero-product-collage"].children.length, 1);
+  assert.match(result.nodes["hero-collage-status"].textContent, /No homepage picks/i);
 });
 test("homepage keeps useful API failure and empty states without inventing products", async () => {
   const nodes = {
     categories: uiElement("div"),
     "home-category-status": uiElement("p"),
-    "featured-products": uiElement("div"),
-    "home-products-status": uiElement("p"),
     "hero-product-collage": uiElement("div"),
     "hero-collage-status": uiElement("p")
   };
   const failed = await runBrowserScript("public/script.js", {
     nodes,
-    fetchImpl: async () => ({ ok: false })
+    fetchImpl: async url => url === "/api/homepage-products" ? ({ ok: false }) : ({ ok: false })
   });
   assert.equal(failed.nodes.categories.children.length, 1, "All Products remains available on category API failure");
   assert.match(failed.nodes["home-category-status"].textContent, /temporarily unavailable/i);
-  assert.equal(failed.nodes["featured-products"].children.length, 0);
-  assert.match(failed.nodes["home-products-status"].textContent, /temporarily unavailable/i);
+  assert.match(failed.nodes["hero-collage-status"].textContent, /temporarily unavailable/i);
 
   const emptyNodes = {
     categories: uiElement("div"),
     "home-category-status": uiElement("p"),
-    "featured-products": uiElement("div"),
-    "home-products-status": uiElement("p"),
     "hero-product-collage": uiElement("div"),
     "hero-collage-status": uiElement("p")
   };
@@ -2178,8 +2441,26 @@ test("homepage keeps useful API failure and empty states without inventing produ
   });
   assert.equal(empty.nodes.categories.children.length, 1);
   assert.match(empty.nodes["home-category-status"].textContent, /No collections/i);
-  assert.match(empty.nodes["home-products-status"].textContent, /no in-stock products/i);
+  assert.match(empty.nodes["hero-collage-status"].textContent, /No homepage picks/i);
 });
+
+test("public brand labels and generated WhatsApp payment messages use Art Corner BLR", () => {
+  const brandedFiles = [
+    "index.html", "cart.html", "checkout.html", "product.html", "products.html", "order-success.html",
+    "track-order.html", "orders.html", "admin.html", "dashboard.html", "categories.html", "login.html"
+  ];
+  brandedFiles.forEach(file => {
+    const html = fs.readFileSync(path.join(__dirname, "../public", file), "utf8");
+    assert.match(html, /Art Corner BLR/, `${file} title uses the current brand`);
+    assert.doesNotMatch(html, /Art Corner Bengaluru/);
+  });
+  const navbar = fs.readFileSync(path.join(__dirname, "../public/components/navbar.html"), "utf8");
+  const footer = fs.readFileSync(path.join(__dirname, "../public/components/footer.html"), "utf8");
+  assert.match(navbar, /Art Corner BLR/);
+  assert.match(footer, /Art Corner BLR/);
+  assert.doesNotMatch(`${navbar}${footer}`, /Art Corner Bengaluru/);
+});
+
 test("product page uses fetched category names and still renders products if category loading fails", async () => {
   const categoryFilter = uiElement("select");
   const pageTitle = uiElement("h1");
@@ -2229,11 +2510,61 @@ test("public product listing renders hostile names as text and rejects unsafe im
       ] }
   });
   assert.equal(nodes.products.children.length, 5);
-  assert.equal(nodes.products.children[0].children[0].textContent, payload);
-  assert.equal(nodes.products.children[0].children.some(child => child.tagName === "img"), false);
-  assert.equal(nodes.products.children[1].children[0].src, "https://res.cloudinary.com/demo/image/upload/b.jpg");
-  assert.equal(nodes.products.children.slice(2).every(card => !card.children.some(child => child.tagName === "img")), true);
+  const firstLink = nodes.products.children[0].children[0];
+  assert.equal(firstLink.children[1].children[0].textContent, payload);
+  assert.equal(firstLink.children.some(child => child.tagName === "img"), false);
+  assert.equal(nodes.products.children[1].children[0].children[0].src, "https://res.cloudinary.com/demo/image/upload/b.jpg");
+  assert.equal(nodes.products.children.slice(2).every(card => !card.children[0].children.some(child => child.tagName === "img")), true);
   assert.equal(nodes.products.children.every(card => card.innerHTML === ""), true);
+});
+test("product grid search is accessible, preserves newest-first results, and adds products to the existing cart", async () => {
+  const nodes = {
+    categoryFilter: uiElement("select"), pageTitle: uiElement("h1"), products: uiElement(), search: uiElement("input"),
+    categoryFeedback: uiElement("p"), productSearchToggle: uiElement("button"), productSearchPanel: uiElement("div"),
+    productSearchClose: uiElement("button")
+  };
+  nodes.productSearchPanel.hidden = true;
+  const newest = { _id: "product-new", name: "New Resin Dish", image: "/uploads/new.jpg", price: 300, inStock: true, createdAt: "2026-11-10T00:00:00.000Z" };
+  const older = { _id: "product-old", name: "Old Resin Dish", image: "https://res.cloudinary.com/demo/image/upload/old.jpg", price: 200, inStock: true, createdAt: "2026-10-10T00:00:00.000Z" };
+  const result = await runBrowserScript("public/products.js", {
+    nodes,
+    fetchImpl: async url => url === "/api/categories"
+      ? { ok: true, json: async () => [{ id: 2, name: "Resin Art" }] }
+      : { ok: true, json: async () => [newest, older] }
+  });
+  assert.equal(nodes.products.children.length, 2);
+  assert.deepEqual(nodes.products.children.map(card => card.children[0].href), ["product.html?id=product-new", "product.html?id=product-old"]);
+  assert.equal(nodes.products.children[0].children[1].textContent, "Add to Cart");
+  nodes.products.children[0].children[1].handlers.click();
+  assert.equal(JSON.parse(result.storage.get("cart"))[0]._id, "product-new");
+  assert.equal(JSON.parse(result.storage.get("cart"))[0].qty, 1);
+  assert.equal(nodes.products.children[0].children[1].textContent, "Added to cart");
+
+  nodes.productSearchToggle.handlers.click();
+  assert.equal(nodes.productSearchPanel.hidden, false);
+  assert.equal(nodes.productSearchToggle.attributes["aria-expanded"], "true");
+  assert.equal(nodes.search.focused, true);
+  nodes.search.value = "old";
+  nodes.search.handlers.input();
+  assert.equal(nodes.products.children.length, 1);
+  assert.match(nodes.products.children[0].children[0].children[1].children[0].textContent, /Old Resin Dish/);
+  result.document.handlers.keydown({ key: "Escape" });
+  assert.equal(nodes.productSearchPanel.hidden, true);
+  assert.equal(nodes.productSearchToggle.focused, true);
+  nodes.productSearchToggle.handlers.click();
+  nodes.productSearchClose.handlers.click();
+  assert.equal(nodes.productSearchPanel.hidden, true);
+});
+test("product grid breakpoints provide two, three, four and five-column layouts without changing admin search", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../public/products.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "../public/style.css"), "utf8");
+  assert.match(html, /id="productSearchToggle"/);
+  assert.match(html, /id="productSearchPanel"[^>]*hidden/);
+  assert.match(css, /\.products-page #products\s*\{\s*display:\s*grid;\s*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(css, /@media \(min-width: 640px\)[\s\S]*?\.products-page #products\s*\{\s*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
+  assert.match(css, /@media \(min-width: 960px\)[\s\S]*?\.products-page #products\s*\{\s*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
+  assert.match(css, /@media \(min-width: 1440px\)[\s\S]*?\.products-page #products\s*\{\s*grid-template-columns:\s*repeat\(5, minmax\(0, 1fr\)\)/);
+  assert.match(css, /object-fit:\s*cover/);
 });
 test("product details safely render database fields and reject unsafe image URLs", async () => {
   const payload = '<svg onload="alert(1)">product</svg>';
@@ -2263,7 +2594,7 @@ test("admin product list renders hostile product data safely and uses event list
       requests.push(url);
       if (url === "/api/categories") return { ok: true, json: async () => [] };
       if (url === "/api/admin/products") return { ok: true, json: async () => [{
-        _id: "bad-id';alert(1);//", name: payload, image: "javascript:alert(1)", price: 12, inStock: true
+        _id: "bad-id';alert(1);//", name: payload, image: "javascript:alert(1)", price: 12, inStock: true, homepageFeatured: true
       }] };
       return { ok: true, json: async () => ({}) };
     }
@@ -2275,6 +2606,43 @@ test("admin product list renders hostile product data safely and uses event list
   const actionButtons = card.children.filter(child => child.tagName === "button");
   assert.deepEqual(actionButtons.map(button => button.textContent), ["Delete", "Toggle Stock"]);
   assert.ok(actionButtons.every(button => typeof button.handlers.click === "function" && !button.attributes.onclick));
+  const homepageLabel = card.children.find(child => child.className === "admin-product-homepage");
+  assert.equal(homepageLabel.children[0].checked, true);
+  assert.equal(homepageLabel.children[1].textContent, " Display on Homepage");
+  assert.equal(homepageLabel.children[2].textContent, "Homepage pick");
+});
+
+test("admin homepage selection toggle persists changes and explains a server-side limit error", async () => {
+  const nodes = { products: uiElement(), category: uiElement("select"), categoryFeedback: uiElement("p") };
+  const alerts = [];
+  const requests = [];
+  let selected = false;
+  await runBrowserScript("public/admin.js", {
+    nodes, requireAdminPage: async () => true, alertImpl: message => alerts.push(message),
+    fetchImpl: async (url, options = {}) => {
+      if (url === "/api/categories") return { ok: true, json: async () => [] };
+      if (url === "/api/admin/products") return { ok: true, json: async () => [{ _id: "product-1", name: "Preview product", price: 25, inStock: true, homepageFeatured: selected }] };
+      requests.push({ url, method: options.method, body: JSON.parse(options.body) });
+      if (!selected) return { ok: false, json: async () => ({ error: "Only three products can be displayed on the homepage" }) };
+      return { ok: true, json: async () => ({ homepageFeatured: true }) };
+    }
+  });
+  const label = nodes.products.children[0].children.find(child => child.className === "admin-product-homepage");
+  const checkbox = label.children[0];
+  assert.equal(checkbox.checked, false);
+  checkbox.checked = true;
+  await checkbox.handlers.change();
+  assert.equal(checkbox.checked, false, "a rejected selection restores the previous setting");
+  assert.match(alerts[0], /Only three products/);
+  assert.deepEqual(requests[0], { url: "/api/products/product-1", method: "PUT", body: { homepageFeatured: true } });
+
+  selected = true;
+  checkbox.checked = true;
+  await checkbox.handlers.change();
+  const updatedLabel = nodes.products.children[0].children.find(child => child.className === "admin-product-homepage");
+  assert.equal(updatedLabel.children[0].checked, true);
+  assert.equal(updatedLabel.children[1].textContent, " Display on Homepage");
+  assert.equal(updatedLabel.children[2].textContent, "Homepage pick");
 });
 function makeOrdersPageNodes() {
   const nodes = Object.fromEntries([
