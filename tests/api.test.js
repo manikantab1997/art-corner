@@ -1354,7 +1354,7 @@ test("shared navigation synchronizes cart badges and supports accessible mobile 
   assert.equal(backdrop.hidden, true);
   assert.equal(typeof windowHandlers.storage, "function");
 });
-test("shop toasts announce, dismiss and sound preferences stay off until enabled by the customer", () => {
+test("shop toasts announce and sound preferences persist, start on, and play only after interaction", () => {
   const appended = [];
   const storage = new Map();
   const timers = new Map();
@@ -1367,7 +1367,7 @@ test("shop toasts announce, dismiss and sound preferences stay off until enabled
     close() { return Promise.resolve(); }
   }
   const document = {
-    body: { appendChild(node) { appended.push(node); } },
+    body: { classList: uiElement().classList, appendChild(node) { appended.push(node); } },
     getElementById: () => null,
     createElement: tag => uiElement(tag),
     querySelectorAll: () => [], querySelector: () => null,
@@ -1384,7 +1384,7 @@ test("shop toasts announce, dismiss and sound preferences stay off until enabled
     clearTimeout(id) { timers.delete(id); }
   });
   vm.runInContext(source, context);
-  assert.equal(context.areShopSoundsEnabled(), false, "sound defaults off");
+  assert.equal(context.areShopSoundsEnabled(), true, "first-time visitors have sound enabled by default");
   assert.equal(audioContexts, 0, "loading the page does not start audio");
 
   const product = { _id: "p1", name: "Handmade Candle", price: 20, inStock: true };
@@ -1394,9 +1394,10 @@ test("shop toasts announce, dismiss and sound preferences stay off until enabled
   assert.equal(JSON.parse(storage.get("cart"))[0].qty, 1, "one add action writes one cart quantity");
   assert.equal(addButton.textContent, "Added to cart");
   assert.equal(addButton.disabled, true, "the button briefly locks to absorb an accidental double click");
-  assert.equal(audioContexts, 0, "disabled sound does not play on an add action");
+  assert.equal(audioContexts, 1, "sound plays only after the explicit add-to-cart interaction");
   context.addCartItemFromClick(product, addButton);
   assert.equal(JSON.parse(storage.get("cart"))[0].qty, 1, "a second click during processing cannot duplicate the add");
+  assert.equal(audioContexts, 1, "the ignored double click does not play another sound");
   const unlockFirst = [...timers.values()].find(timer => timer.delay === 180);
   unlockFirst.callback();
   assert.equal(addButton.disabled, false);
@@ -1415,19 +1416,66 @@ test("shop toasts announce, dismiss and sound preferences stay off until enabled
   const toggle = uiElement("button");
   const root = { querySelectorAll: () => [toggle] };
   context.setupShopSoundToggles(root);
-  assert.equal(toggle.textContent, "Sound off");
-  assert.equal(toggle.attributes["aria-pressed"], "false");
-  toggle.handlers.click();
-  assert.equal(storage.get("artcorner.sound-enabled"), "true", "sound preference persists locally");
+  assert.equal(toggle.textContent, "Sound on");
   assert.equal(toggle.attributes["aria-pressed"], "true");
+  toggle.handlers.click();
+  assert.equal(storage.get("artcorner.sound-enabled"), "false", "the explicit OFF preference persists locally");
+  assert.equal(toggle.attributes["aria-pressed"], "false");
+  const offReloadContext = vm.createContext({
+    document, window, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    Event: class {}, console,
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { delay, callback }); return id; },
+    clearTimeout(id) { timers.delete(id); }
+  });
+  vm.runInContext(source, offReloadContext);
+  assert.equal(offReloadContext.areShopSoundsEnabled(), false, "saved OFF remains OFF after navigation or refresh");
   context.addCartItemFromClick(product, addButton);
   assert.equal(JSON.parse(storage.get("cart"))[0].qty, 2);
-  assert.equal(audioContexts, 1, "sound is generated only in response to the add interaction after opt-in");
+  assert.equal(audioContexts, 1, "a saved OFF preference prevents playback");
   [...timers.values()].find(timer => timer.delay === 180).callback();
-  toggle.handlers.click();
+
+  const mobileSoundSwitch = uiElement("button");
+  mobileSoundSwitch.setAttribute("role", "switch");
+  const mobileSoundState = uiElement("span");
+  mobileSoundSwitch.querySelector = selector => selector === "[data-sound-state]" ? mobileSoundState : null;
+  const mobileMenu = uiElement("aside");
+  mobileMenu.querySelectorAll = selector => selector === "a[href]" ? [] : [];
+  const menuToggle = uiElement("button");
+  const menuClose = uiElement("button");
+  const menuBackdrop = uiElement("button");
+  menuBackdrop.hidden = true;
+  const mobileRoot = { querySelector: selector => ({
+    "#mobileMenuToggle": menuToggle,
+    "#mobileMenu": mobileMenu,
+    "#mobileMenuClose": menuClose,
+    "#mobileMenuBackdrop": menuBackdrop
+  })[selector] || null };
+  const mobileToggleRoot = { querySelectorAll: () => [mobileSoundSwitch] };
+  context.setupShopSoundToggles(mobileToggleRoot);
+  assert.equal(mobileSoundSwitch.attributes["aria-checked"], "false", "a saved OFF value is shown as OFF");
+  assert.equal(mobileSoundState.textContent, "OFF");
+  context.setupMobileNavigation(mobileRoot);
+  menuToggle.handlers.click();
+  assert.equal(mobileMenu.classList.contains("is-open"), true);
+  mobileSoundSwitch.handlers.click();
+  assert.equal(mobileMenu.classList.contains("is-open"), true, "toggling sound does not close the menu");
+  assert.equal(storage.get("artcorner.sound-enabled"), "true", "the ON preference is persisted");
+  assert.equal(mobileSoundSwitch.attributes["aria-checked"], "true");
+  assert.equal(mobileSoundState.textContent, "ON");
+
+  const reloadContext = vm.createContext({
+    document, window, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    Event: class {}, console,
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { delay, callback }); return id; },
+    clearTimeout(id) { timers.delete(id); }
+  });
+  vm.runInContext(source, reloadContext);
+  assert.equal(reloadContext.areShopSoundsEnabled(), true, "saved ON state survives a page reload");
+  assert.equal(audioContexts, 1, "reloading the page does not autoplay sound");
+
   context.addCartItemFromClick(product, addButton);
   assert.equal(JSON.parse(storage.get("cart"))[0].qty, 3);
-  assert.equal(audioContexts, 1, "turning sound off prevents further playback");
+  assert.equal(audioContexts, 2, "turning sound back on permits sound on a later user action");
 });
 test("bottom navigation markup and its reserved page spacing are removed", () => {
   const htmlFiles = fs.readdirSync(path.join(__dirname, "../public")).filter(file => file.endsWith(".html"));
@@ -2573,6 +2621,10 @@ test("public brand labels and generated WhatsApp payment messages use Art Corner
   assert.equal((navbar.match(/class="nav-brand"/g) || []).length, 1, "the shared navbar has one visible brand link");
   assert.match(navbar, /<a href="index\.html" class="nav-brand" aria-label="Art Corner BLR home">Art Corner BLR<\/a>/);
   assert.match(navbar, /<a href="index\.html" class="logo" aria-label="Art Corner BLR home">/);
+  const mobileLinks = navbar.match(/<nav class="mobile-menu-links"[\s\S]*?<\/nav>/)?.[0] || "";
+  assert.doesNotMatch(mobileLinks, /data-shop-sound-toggle/, "mobile sound control is outside the navigation link list");
+  assert.match(navbar, /<\/nav>\s*<div class="mobile-sound-preference-wrap">[\s\S]*?role="switch"[\s\S]*?aria-labelledby="mobileSoundLabel"[\s\S]*?Enable or disable interaction sounds[\s\S]*?<\/div>\s*<\/aside>/);
+  assert.equal((navbar.match(/data-shop-sound-toggle/g) || []).length, 2, "desktop retains its compact control and mobile has one dedicated menu switch");
   assert.match(footer, /Art Corner BLR/);
   assert.doesNotMatch(`${navbar}${footer}`, /Art Corner Bengaluru/);
   const styles = fs.readFileSync(path.join(__dirname, "../public/style.css"), "utf8");
@@ -2581,6 +2633,10 @@ test("public brand labels and generated WhatsApp payment messages use Art Corner
     "tablet widths reserve a second row for desktop navigation links");
   assert.match(styles, /\.navbar\.navbar-has-contextual-back \.nav-brand/,
     "narrow contextual-back pages reserve space for the existing back link");
+  assert.match(styles, /\.mobile-sound-preference-wrap\s*\{[^}]*border-top:/s, "mobile sound preference has a visual divider");
+  assert.match(styles, /\.mobile-sound-preference\.is-on \.mobile-sound-switch/, "mobile switch clearly styles its ON state");
+  assert.match(styles, /\.mobile-sound-preference\[hidden\]\s*\{\s*display:\s*none;/,
+    "hidden admin-page sound controls remain hidden despite button styling");
 });
 
 test("product page uses fetched category names and still renders products if category loading fails", async () => {

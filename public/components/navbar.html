@@ -13,7 +13,7 @@
         <a href="products.html">Products</a>
         <a href="track-order.html">Track Order</a>
         <a href="cart.html" class="nav-cart-link" aria-label="Cart, 0 items">Cart <span class="cart-badge" data-cart-count aria-hidden="true" hidden>0</span></a>
-        <button class="shop-sound-toggle" type="button" data-shop-sound-toggle aria-pressed="false">Sound off</button>
+        <button class="shop-sound-toggle" type="button" data-shop-sound-toggle aria-pressed="true">Sound on</button>
         <a href="login.html" data-nav-login>Account</a>
         <a href="dashboard.html" data-nav-dashboard hidden>Dashboard</a>
         <a href="#" data-nav-logout hidden>Logout</a>
@@ -49,9 +49,24 @@
         <a href="products.html">Products</a>
         <a href="track-order.html">Track Order</a>
         <a href="cart.html">Cart <span class="cart-badge" data-cart-count aria-hidden="true" hidden>0</span></a>
-        <button class="shop-sound-toggle mobile-sound-toggle" type="button" data-shop-sound-toggle aria-pressed="false">Sound off</button>
         <a href="login.html" data-nav-login>Account</a>
         <a href="dashboard.html" data-nav-dashboard hidden>Dashboard</a>
         <a href="#" data-nav-logout hidden>Logout</a>
     </nav>
+    <div class="mobile-sound-preference-wrap">
+        <button class="mobile-sound-preference" type="button" data-shop-sound-toggle role="switch" aria-checked="true" aria-labelledby="mobileSoundLabel" aria-describedby="mobileSoundDescription">
+            <span class="mobile-sound-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false">
+                    <path d="M4 10v4h4l5 4V6l-5 4H4z" />
+                    <path d="M16 9a4 4 0 0 1 0 6m2-8a7 7 0 0 1 0 10" />
+                </svg>
+            </span>
+            <span class="mobile-sound-copy">
+                <span id="mobileSoundLabel">Sound effects</span>
+                <span id="mobileSoundDescription">Enable or disable interaction sounds</span>
+            </span>
+            <span class="mobile-sound-state" data-sound-state>ON</span>
+            <span class="mobile-sound-switch" aria-hidden="true"><span></span></span>
+        </button>
+    </div>
 </aside>

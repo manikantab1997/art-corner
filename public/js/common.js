@@ -122,23 +122,34 @@ function showShopToast(message, { error = false, duration = 3000 } = {}) {
 }
 
 function areShopSoundsEnabled() {
-    try { return localStorage.getItem(shopSoundPreferenceKey) === "true"; }
-    catch { return false; }
+    try { return localStorage.getItem(shopSoundPreferenceKey) !== "false"; }
+    catch { return true; }
 }
 
 function updateShopSoundToggles(root = document) {
     const enabled = areShopSoundsEnabled();
     root.querySelectorAll("[data-shop-sound-toggle]").forEach(button => {
-        button.setAttribute("aria-pressed", String(enabled));
-        button.textContent = enabled ? "Sound on" : "Sound off";
-        button.setAttribute("aria-label", `Sound effects ${enabled ? "on" : "off"}. Activate to turn ${enabled ? "off" : "on"}.`);
+        if (button.getAttribute("role") === "switch") {
+            button.setAttribute("aria-checked", String(enabled));
+            button.classList.toggle("is-on", enabled);
+            const state = button.querySelector("[data-sound-state]");
+            if (state) state.textContent = enabled ? "ON" : "OFF";
+        } else {
+            button.setAttribute("aria-pressed", String(enabled));
+            button.textContent = enabled ? "Sound on" : "Sound off";
+            button.setAttribute("aria-label", `Sound effects ${enabled ? "on" : "off"}. Activate to turn ${enabled ? "off" : "on"}.`);
+        }
     });
 }
 
 function setupShopSoundToggles(root, hide = false) {
     const toggles = [...root.querySelectorAll("[data-shop-sound-toggle]")];
     if (hide) {
-        toggles.forEach(button => { button.hidden = true; });
+        toggles.forEach(button => {
+            button.hidden = true;
+            const preferenceWrap = button.closest?.(".mobile-sound-preference-wrap");
+            if (preferenceWrap) preferenceWrap.hidden = true;
+        });
         return;
     }
     updateShopSoundToggles(root);
@@ -326,9 +337,9 @@ async function loadNavbar() {
         if (!response.ok) throw new Error("Navigation could not be loaded.");
         navbarContainer.innerHTML = await response.text();
         setupContextualBackLink(navbarContainer);
-        const isAdmin = await getAdminSession();
         const currentPage = (window.location.pathname || "").split("/").pop().toLowerCase();
         setupShopSoundToggles(navbarContainer, ["admin.html", "dashboard.html", "orders.html", "categories.html", "login.html"].includes(currentPage));
+        const isAdmin = await getAdminSession();
         document.querySelectorAll("[data-nav-dashboard]").forEach(link => { link.hidden = !isAdmin; });
         document.querySelectorAll("[data-nav-logout]").forEach(link => { link.hidden = !isAdmin; });
         document.querySelectorAll("[data-nav-login]").forEach(link => { link.hidden = isAdmin; });
